@@ -23,6 +23,7 @@ import org.apache.spark.sql.types.StructType;
 public class DruidDataSourceWriterBuilder implements WriteBuilder, SupportsTruncate {
   private final StructType schema;
   private final WriterContext param;
+  private boolean isAppend = true;
 
   public DruidDataSourceWriterBuilder(StructType schema, WriterContext param) {
     this.schema = schema;
@@ -31,11 +32,12 @@ public class DruidDataSourceWriterBuilder implements WriteBuilder, SupportsTrunc
 
   @Override
   public BatchWrite buildForBatch() {
-    return new DruidDataSourceWriter(schema, param);
+    return new DruidDataSourceWriter(schema, param, isAppend);
   }
 
   @Override
   public WriteBuilder truncate() {
+    this.isAppend = false;
     return this;
   }
 }

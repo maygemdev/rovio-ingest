@@ -78,6 +78,9 @@ public class WriterContext implements Serializable {
     private final boolean rollup;
     private final boolean useDefaultValueForNull;
     private final boolean useThreeValueLogicForNativeFilters;
+    private final boolean overwriteAppend;
+    private final int overwriteAppendPartitionNumStart;
+    private final int overwriteAppendPartitionNumEnd;
     private final String dimensionsSpec;
     private final String metricsSpec;
     private final String transformSpec;
@@ -144,6 +147,22 @@ public class WriterContext implements Serializable {
         this.transformSpec = options.getOrDefault(ConfKeys.TRANSFORM_SPEC, null);
 
         this.version = version;
+
+        this.overwriteAppend = options.getBoolean(ConfKeys.OVERWRITE_APPEND, false);
+        this.overwriteAppendPartitionNumStart = options.getInt(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START, -1);
+        this.overwriteAppendPartitionNumEnd = options.getInt(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END, -1);
+        if (this.overwriteAppend) {
+            if (this.overwriteAppendPartitionNumStart <= 0) {
+                throw missingKeyError(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START);
+            }
+            if (this.overwriteAppendPartitionNumEnd <= 0) {
+                throw missingKeyError(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END);
+            }
+            if (this.overwriteAppendPartitionNumStart >= this.overwriteAppendPartitionNumEnd) {
+                throw new IllegalArgumentException(format("\"%s\" should be less than \"%s\"",
+                        ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START, ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END));
+            }
+        }
     }
 
     public static WriterContext from(CaseInsensitiveStringMap options, String version) {
@@ -155,7 +174,11 @@ public class WriterContext implements Serializable {
             return options.get(key);
         }
 
-        throw new IllegalArgumentException(format("Missing mandatory \"%s\" option", key));
+        throw missingKeyError(key);
+    }
+
+    private static IllegalArgumentException missingKeyError(String key) {
+        return new IllegalArgumentException(format("Missing mandatory \"%s\" option", key));
     }
 
     public String getDataSource() {
@@ -326,6 +349,18 @@ public class WriterContext implements Serializable {
         return useThreeValueLogicForNativeFilters;
     }
 
+    public boolean isOverwriteAppend() {
+        return overwriteAppend;
+    }
+
+    public int getOverwriteAppendPartitionNumStart() {
+        return overwriteAppendPartitionNumStart;
+    }
+
+    public int getOverwriteAppendPartitionNumEnd() {
+        return overwriteAppendPartitionNumEnd;
+    }
+
     public String getDimensionsSpec() {
         return dimensionsSpec;
     }
@@ -355,6 +390,9 @@ public class WriterContext implements Serializable {
         public static final String SEGMENT_ROLLUP = "druid.segment.rollup";
         public static final String USE_DEFAULT_VALUES_FOR_NULL = "druid.use_default_values_for_null";
         public static final String USE_THREE_VALUE_LOGIC_FOR_NATIVE_FILTERS = "druid.use_three_value_logic_for_native_filters";
+        public static final String OVERWRITE_APPEND = "druid.overwrite_append";
+        public static final String OVERWRITE_APPEND_PARTITION_NUM_START = "druid.overwrite_append_partition_num_start";
+        public static final String OVERWRITE_APPEND_PARTITION_NUM_END = "druid.overwrite_append_partition_num_end";
         // Metadata config
         public static final String METADATA_DB_TYPE = "druid.metastore.db.type";
         public static final String METADATA_DB_URI = "druid.metastore.db.uri";

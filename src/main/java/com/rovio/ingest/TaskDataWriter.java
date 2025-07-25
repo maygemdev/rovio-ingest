@@ -19,6 +19,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.rovio.ingest.model.Field;
 import com.rovio.ingest.model.FieldType;
 import com.rovio.ingest.model.SegmentSpec;
+import com.rovio.ingest.util.MetadataUpdater;
 import com.rovio.ingest.util.ReflectionUtils;
 import com.rovio.ingest.util.SegmentStorageUpdater;
 import org.apache.druid.common.config.NullHandling;
@@ -51,6 +52,7 @@ import org.apache.druid.segment.realtime.plumber.Committers;
 import org.apache.druid.segment.realtime.plumber.CustomVersioningPolicy;
 import org.apache.druid.segment.writeout.TmpFileSegmentWriteOutMediumFactory;
 import org.apache.druid.timeline.DataSegment;
+import org.apache.druid.timeline.SegmentId;
 import org.apache.druid.timeline.partition.LinearShardSpec;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.util.ArrayData;
@@ -69,13 +71,17 @@ import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
 
@@ -92,16 +98,24 @@ class TaskDataWriter implements DataWriter<InternalRow> {
     private final Appenderator appenderator;
     private final DataSegmentKiller segmentKiller;
     private final Supplier<Committer> committerSupplier;
+    private final Set<String> segmentsToMarkUnused;
     private final Set<DataSegment> pushedSegments;
     private final File basePersistDirectory;
+    private final WriterContext context;
+    private final MetadataUpdater metadataUpdater;
+    private final boolean isAppend;
+    private final Map<Interval, VersionWithPartitionNum> intervalVersionMap;
 
     private SegmentIdWithShardSpec current;
 
-    TaskDataWriter(long taskId, WriterContext context, SegmentSpec segmentSpec) {
+    TaskDataWriter(long taskId, WriterContext context, SegmentSpec segmentSpec, boolean isAppend) {
         this.taskId = taskId;
         this.segmentSpec = segmentSpec;
         this.maxRows = context.getSegmentMaxRows();
         this.dataSchema = segmentSpec.getDataSchema();
+        this.context = context;
+        this.metadataUpdater = isAppend ? new MetadataUpdater(context) : null; // don't make a connection if it's overwrite (we will not need it)
+        this.isAppend = isAppend;
 
         this.tuningConfig = getTuningConfig(context);
         DataSegmentPusher segmentPusher = SegmentStorageUpdater.createPusher(context);
@@ -114,7 +128,9 @@ class TaskDataWriter implements DataWriter<InternalRow> {
         this.appenderator = new DefaultOfflineAppenderatorFactory(segmentPusher, MAPPER, INDEX_IO, INDEX_MERGER_V_9)
                 .build(dataSchema, tuningConfig.withBasePersistDirectory(basePersistDirectory), new FireDepartmentMetrics());
         this.committerSupplier = Committers::nil;
+        this.segmentsToMarkUnused = new HashSet<>();
         this.pushedSegments = new HashSet<>();
+        this.intervalVersionMap = new HashMap<>();
         this.appenderator.startJob();
 
         try {
@@ -178,7 +194,7 @@ class TaskDataWriter implements DataWriter<InternalRow> {
             List<SegmentIdWithShardSpec> toPush = appenderator.getSegments();
             pushSegments(toPush);
             LOG.info("Commit taskId = {}, pushedSegments={}", taskId, pushedSegments.size());
-            return DataSegmentCommitMessage.getInstance(pushedSegments);
+            return DataSegmentCommitMessage.getInstance(new ArrayList<>(pushedSegments), segmentsToMarkUnused);
         } finally {
             appenderator.close();
         }
@@ -269,12 +285,58 @@ class TaskDataWriter implements DataWriter<InternalRow> {
     }
 
     private SegmentIdWithShardSpec newSegmentId(Interval interval, int partitionNum) {
-        return new SegmentIdWithShardSpec(
-                dataSchema.getDataSource(),
-                interval,
-                tuningConfig.getVersioningPolicy().getVersion(interval),
-                new LinearShardSpec(partitionNum)
-        );
+        if (isAppend) {
+            VersionWithPartitionNum versionWithPartitionNum = intervalVersionMap.computeIfAbsent(interval, (k) -> {
+                List<SegmentId> segmentIds = metadataUpdater.findUsedSegments(dataSchema.getDataSource(), interval).stream()
+                        .map(s -> SegmentId.tryParse(dataSchema.getDataSource(), s))
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toList());
+
+                if (context.isOverwriteAppend()) {
+                    Optional<SegmentId> segmentWithMaxPartitionNum = segmentIds.stream()
+                            .filter(s -> s.getPartitionNum() >= context.getOverwriteAppendPartitionNumStart()
+                                    && s.getPartitionNum() < context.getOverwriteAppendPartitionNumEnd())
+                            .peek(s -> segmentsToMarkUnused.add(s.toString()))
+                            .max(Comparator.comparing(SegmentId::getPartitionNum));
+
+                    return segmentWithMaxPartitionNum
+                            .map(s -> new VersionWithPartitionNum(s.getVersion(), s.getPartitionNum() + 1))
+                            .orElseGet(() -> {
+                                // if we have used segment not within specified offset range
+                                // we should still use its version to make sure segments will be appended
+                                String version = segmentIds.isEmpty()
+                                        ? tuningConfig.getVersioningPolicy().getVersion(interval)
+                                        : segmentIds.get(0).getVersion();
+                                return new VersionWithPartitionNum(version, context.getOverwriteAppendPartitionNumStart());
+                            });
+                } else {
+                    return segmentIds.stream()
+                            .max(Comparator.comparing(SegmentId::getPartitionNum))
+                            .map(s -> new VersionWithPartitionNum(s.getVersion(), s.getPartitionNum() + 1))
+                            .orElseGet(() -> new VersionWithPartitionNum(tuningConfig.getVersioningPolicy().getVersion(interval), 0));
+                }
+            });
+
+            int segmentPartitionNum = versionWithPartitionNum.maxPartitionNum + partitionNum;
+            if (context.isOverwriteAppend() && segmentPartitionNum >= context.getOverwriteAppendPartitionNumEnd()) {
+                throw new IllegalStateException(String.format("Partition nums have just reached its end = %d",
+                        context.getOverwriteAppendPartitionNumEnd()));
+            }
+
+            return new SegmentIdWithShardSpec(
+                    dataSchema.getDataSource(),
+                    interval,
+                    versionWithPartitionNum.version,
+                    new LinearShardSpec(segmentPartitionNum)
+            );
+        } else {
+            return new SegmentIdWithShardSpec(
+                    dataSchema.getDataSource(),
+                    interval,
+                    tuningConfig.getVersioningPolicy().getVersion(interval),
+                    new LinearShardSpec(partitionNum)
+            );
+        }
     }
 
     private void pushSegments(List<SegmentIdWithShardSpec> toPush) throws IOException {
@@ -291,7 +353,8 @@ class TaskDataWriter implements DataWriter<InternalRow> {
                 appenderator.drop(identifier).get();
             }
             pushedSegments.addAll(updated);
-            LOG.info("TaskId={}, pushed segments {}", taskId, pushedSegments.size());
+            LOG.info("TaskId={}, pushed segments {}, unused segments {}",
+                    taskId, pushedSegments.size(), segmentsToMarkUnused.size());
         } catch (InterruptedException | ExecutionException e) {
             throw new IOException("Failed to push segment", e);
         }
@@ -337,6 +400,16 @@ class TaskDataWriter implements DataWriter<InternalRow> {
     public void close() throws IOException {
         if (this.basePersistDirectory != null) {
             FileUtils.deleteDirectory(basePersistDirectory);
+        }
+    }
+
+    private static final class VersionWithPartitionNum {
+        private final String version;
+        private final int maxPartitionNum;
+
+        private VersionWithPartitionNum(String version, int maxPartitionNum) {
+            this.version = version;
+            this.maxPartitionNum = maxPartitionNum;
         }
     }
 }

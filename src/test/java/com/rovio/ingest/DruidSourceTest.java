@@ -16,6 +16,7 @@
 package com.rovio.ingest;
 
 import com.google.common.collect.Lists;
+import org.apache.druid.timeline.SegmentId;
 import org.apache.spark.SparkException;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
@@ -28,7 +29,9 @@ import org.joda.time.DateTime;
 import org.joda.time.DateTimeUtils;
 import org.joda.time.Interval;
 import org.joda.time.chrono.ISOChronology;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 import scala.collection.JavaConverters;
 
 import java.io.IOException;
@@ -37,6 +40,9 @@ import java.util.List;
 
 import static com.rovio.ingest.WriterContext.ConfKeys.DATASOURCE_INIT;
 import static com.rovio.ingest.WriterContext.ConfKeys.EXCLUDED_DIMENSIONS;
+import static com.rovio.ingest.WriterContext.ConfKeys.OVERWRITE_APPEND;
+import static com.rovio.ingest.WriterContext.ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END;
+import static com.rovio.ingest.WriterContext.ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_GRANULARITY;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_MAX_ROWS;
 import static org.apache.spark.sql.functions.callUDF;
@@ -50,11 +56,48 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 public class DruidSourceTest extends DruidSourceBaseTest {
 
     @Test
-    public void failForAppendMode() {
+    public void failForWithoutDatasourceOption() {
         Dataset<Row> dataset = loadCsv(spark, "/data.csv");
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
                 () -> dataset.write().format("com.rovio.ingest.DruidSource").mode(SaveMode.Append).save());
         assertThat(thrown.getMessage(), containsString("Missing mandatory \"druid.datasource\" option"));
+    }
+
+    @Test
+    public void failForInitDatasourceWithAppendWriteMode() {
+        options.put(DATASOURCE_INIT, "true");
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                () -> loadCsv(spark, "/data.csv")
+                        .write()
+                        .format("com.rovio.ingest.DruidSource")
+                        .mode(SaveMode.Append)
+                        .options(options)
+                        .save());
+
+        assertThat(thrown.getMessage(), containsString("Init database with Append write mode is not supported"));
+    }
+
+    @Test
+    public void failForInvalidOptionsForAppendWriteModeWithOverrideAppend() {
+        options.put(OVERWRITE_APPEND, "true");
+        Executable runJob = () -> loadCsv(spark, "/data.csv")
+                .write()
+                .format("com.rovio.ingest.DruidSource")
+                .mode(SaveMode.Append)
+                .options(options)
+                .save();
+
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class, runJob);
+        assertThat(thrown.getMessage(), containsString("Missing mandatory \"druid.overwrite_append_partition_num_start\" option"));
+
+        options.put(OVERWRITE_APPEND_PARTITION_NUM_START, "1000");
+        thrown = assertThrows(IllegalArgumentException.class, runJob);
+        assertThat(thrown.getMessage(), containsString("Missing mandatory \"druid.overwrite_append_partition_num_end\" option"));
+
+        options.put(OVERWRITE_APPEND_PARTITION_NUM_END, "1000");
+        thrown = assertThrows(IllegalArgumentException.class, runJob);
+        assertThat(thrown.getMessage(), containsString("\"druid.overwrite_append_partition_num_start\" should be " +
+                "less than \"druid.overwrite_append_partition_num_end\""));
     }
 
     @Test
@@ -89,7 +132,120 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         Interval interval = new Interval(DateTime.parse("2019-10-16T00:00:00Z"), DateTime.parse("2019-10-18T00:00:00Z"));
         String version = DateTime.now(ISOChronology.getInstanceUTC()).toString();
         verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 1, false);
-        verifySegmentTable(interval, version, true, 2);
+        List<SegmentId> segmentIds = verifySegmentTable(interval, version, true, 2);
+        Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(0).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(0).getIntervalEnd().toString());
+        Assertions.assertEquals(0, segmentIds.get(0).getPartitionNum());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
+        Assertions.assertEquals(0, segmentIds.get(1).getPartitionNum());
+
+        DateTimeUtils.setCurrentMillisFixed(VERSION_TIME_MILLIS + 60_000);
+
+        dataset.write()
+                .format("com.rovio.ingest.DruidSource")
+                .mode(SaveMode.Overwrite)
+                .options(options)
+                .save();
+
+        version = DateTime.now(ISOChronology.getInstanceUTC()).toString();
+        verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 1, false);
+        segmentIds = verifySegmentTable(interval, version, true, 2);
+        Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(0).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(0).getIntervalEnd().toString());
+        Assertions.assertEquals(0, segmentIds.get(0).getPartitionNum());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
+        Assertions.assertEquals(0, segmentIds.get(1).getPartitionNum());
+    }
+
+    @Test
+    public void passWhenPartitionedByTimeWithAppendWriteMode() throws IOException {
+        Dataset<Row> dataset = loadCsv(spark, "/data.csv");
+        dataset = dataset.repartition(column("date"));
+        dataset.show(false);
+
+        dataset.write()
+                .format("com.rovio.ingest.DruidSource")
+                .mode(SaveMode.Append)
+                .options(options)
+                .save();
+
+        Interval interval = new Interval(DateTime.parse("2019-10-16T00:00:00Z"), DateTime.parse("2019-10-18T00:00:00Z"));
+        String version = DateTime.now(ISOChronology.getInstanceUTC()).toString();
+        verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 1, false);
+        List<SegmentId> segmentIds = verifySegmentTable(interval, version, true, 2);
+        Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(0).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(0).getIntervalEnd().toString());
+        Assertions.assertEquals(0, segmentIds.get(0).getPartitionNum());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
+        Assertions.assertEquals(0, segmentIds.get(1).getPartitionNum());
+
+        DateTimeUtils.setCurrentMillisFixed(VERSION_TIME_MILLIS + 60_000);
+
+        dataset.write()
+                .format("com.rovio.ingest.DruidSource")
+                .mode(SaveMode.Append)
+                .options(options)
+                .save();
+
+        verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 2, false);
+        segmentIds = verifySegmentTable(interval, version, true, 4);
+        Assertions.assertEquals(0, segmentIds.get(0).getPartitionNum());
+        Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
+        Assertions.assertEquals(1, segmentIds.get(1).getPartitionNum());
+        Assertions.assertEquals(0, segmentIds.get(2).getPartitionNum());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(3).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(3).getIntervalEnd().toString());
+        Assertions.assertEquals(1, segmentIds.get(3).getPartitionNum());
+    }
+
+    @Test
+    public void passWhenPartitionedByTimeWithAppendWriteModeAndOverwriteAppendFlag() throws IOException {
+        options.put(OVERWRITE_APPEND, "true");
+        options.put(OVERWRITE_APPEND_PARTITION_NUM_START, "1000");
+        options.put(OVERWRITE_APPEND_PARTITION_NUM_END, "2000");
+
+        Dataset<Row> dataset = loadCsv(spark, "/data.csv");
+        dataset = dataset.repartition(column("date"));
+        dataset.show(false);
+
+        dataset.write()
+                .format("com.rovio.ingest.DruidSource")
+                .mode(SaveMode.Append)
+                .options(options)
+                .save();
+
+        Interval interval = new Interval(DateTime.parse("2019-10-16T00:00:00Z"), DateTime.parse("2019-10-18T00:00:00Z"));
+        String version = DateTime.now(ISOChronology.getInstanceUTC()).toString();
+        verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 1, false);
+        List<SegmentId> segmentIds = verifySegmentTable(interval, version, true, 2);
+        Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(0).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(0).getIntervalEnd().toString());
+        Assertions.assertEquals(1000, segmentIds.get(0).getPartitionNum());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
+        Assertions.assertEquals(1000, segmentIds.get(1).getPartitionNum());
+
+        DateTimeUtils.setCurrentMillisFixed(VERSION_TIME_MILLIS + 60_000);
+
+        dataset.write()
+                .format("com.rovio.ingest.DruidSource")
+                .mode(SaveMode.Append)
+                .options(options)
+                .save();
+
+        verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 2, false);
+        verifySegmentTable(interval, version, false, 2);
+        segmentIds = verifySegmentTable(interval, version, true, 2);
+        Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(0).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(0).getIntervalEnd().toString());
+        Assertions.assertEquals(1001, segmentIds.get(0).getPartitionNum());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
+        Assertions.assertEquals(1001, segmentIds.get(1).getPartitionNum());
     }
 
     @Test
@@ -184,6 +340,31 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         String version = DateTime.now(ISOChronology.getInstanceUTC()).toString();
         verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 4, false);
         verifySegmentTable(interval, version, true, 8);
+    }
+
+    @Test
+    public void passForDayGranularityWithMaxRowsAndAppendOverrideFlagExceedingPartitionNumEnd() throws IOException {
+        Dataset<Row> dataset = loadCsv(spark, "/data.csv");
+        List<Column> columns = Lists.newArrayList(unix_timestamp(column("date")).multiply(1000), lit("DAY"));
+        dataset = dataset.withColumn("__partition",
+                callUDF("normalizeTimeColumn",
+                        JavaConverters.asScalaIteratorConverter(columns.iterator()).asScala().toSeq()));
+
+        Dataset<Row> newDataset = dataset.repartition(column("__partition"));
+        newDataset.show(false);
+
+        options.put(EXCLUDED_DIMENSIONS, "__partition");
+        options.put(SEGMENT_MAX_ROWS, String.valueOf(1));
+        options.put(OVERWRITE_APPEND, "true");
+        options.put(OVERWRITE_APPEND_PARTITION_NUM_START, "10");
+        options.put(OVERWRITE_APPEND_PARTITION_NUM_END, "18");
+        SparkException thrown = assertThrows(SparkException.class,
+                () -> newDataset.write()
+                        .format("com.rovio.ingest.DruidSource")
+                        .mode(SaveMode.Append)
+                        .options(options)
+                        .save());
+        assertThat(thrown.getCause().getMessage(), containsString("Partition nums have just reached its end = 18"));
     }
 
     @Test

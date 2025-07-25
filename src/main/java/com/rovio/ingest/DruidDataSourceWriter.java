@@ -15,6 +15,7 @@
  */
 package com.rovio.ingest;
 
+import com.rovio.ingest.model.ProcessedSegmentData;
 import com.rovio.ingest.model.SegmentSpec;
 import com.rovio.ingest.util.MetadataUpdater;
 import com.rovio.ingest.util.SegmentStorageUpdater;
@@ -29,7 +30,6 @@ import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.StructType;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
 
 class DruidDataSourceWriter implements BatchWrite {
@@ -37,18 +37,24 @@ class DruidDataSourceWriter implements BatchWrite {
     private final WriterContext param;
     private final SegmentSpec segmentSpec;
     private final MetadataUpdater metadataUpdater;
+    private final boolean isAppend;
 
-    DruidDataSourceWriter(StructType schema, WriterContext param) {
+    DruidDataSourceWriter(StructType schema, WriterContext param, boolean isAppend) {
+        if (param.isInitDataSource() && isAppend) {
+            // in append mode we don't know all "active" segments, thus can't properly mark other segments as unused
+            throw new IllegalStateException("Init database with Append write mode is not supported");
+        }
         this.param = param;
         this.segmentSpec = SegmentSpec.from(param.getDataSource(),param.getTimeColumn(), param.getExcludedDimensions(),
                 param.getSegmentGranularity(), param.getQueryGranularity(), schema, param.isRollup(),
                 param.getDimensionsSpec(), param.getMetricsSpec(), param.getTransformSpec());
         this.metadataUpdater = new MetadataUpdater(param);
+        this.isAppend = isAppend;
     }
 
     @Override
     public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo physicalWriteInfo) {
-        return new TaskWriterFactory(param, segmentSpec);
+        return new TaskWriterFactory(param, segmentSpec, isAppend);
     }
 
     @Override
@@ -63,29 +69,29 @@ class DruidDataSourceWriter implements BatchWrite {
 
     @Override
     public final void commit(WriterCommitMessage[] messages) {
-        List<DataSegment> dataSegments = toDataSegments(messages);
+        ProcessedSegmentData dataSegments = toDataSegments(messages);
         if (metadataUpdater != null) {
-            metadataUpdater.publishSegments(dataSegments);
+            metadataUpdater.publishSegments(dataSegments.getAddedSegments(), dataSegments.getSegmentsToMarkUnused());
         }
     }
 
     @Override
     public final void abort(WriterCommitMessage[] messages) {
-        List<DataSegment> dataSegments = toDataSegments(messages);
+        List<DataSegment> dataSegments = toDataSegments(messages).getAddedSegments();
         DataSegmentKiller segmentKiller = SegmentStorageUpdater.createKiller(param);
         dataSegments.forEach(segmentKiller::killQuietly);
     }
 
-    private List<DataSegment> toDataSegments(WriterCommitMessage[] messages) {
+    private ProcessedSegmentData toDataSegments(WriterCommitMessage[] messages) {
         try {
-            List<DataSegment> segments = new ArrayList<>();
+            ProcessedSegmentData data = new ProcessedSegmentData();
             for (WriterCommitMessage message : messages) {
                 DataSegmentCommitMessage segmentCommitMessage = (DataSegmentCommitMessage) message;
                 if (segmentCommitMessage != null) {
-                    segments.addAll(segmentCommitMessage.getSegments());
+                    data.merge(segmentCommitMessage.getSegments());
                 }
             }
-            return segments;
+            return data;
         } catch (IOException e) {
             throw new RuntimeException("Failed to deserialize data segments", e);
         }
@@ -95,15 +101,17 @@ class DruidDataSourceWriter implements BatchWrite {
 
         private final WriterContext params;
         private final SegmentSpec segmentSpec;
+        private final boolean isAppend;
 
-        TaskWriterFactory(WriterContext params, SegmentSpec segmentSpec) {
+        TaskWriterFactory(WriterContext params, SegmentSpec segmentSpec, boolean isAppend) {
             this.params = params;
             this.segmentSpec = segmentSpec;
+            this.isAppend = isAppend;
         }
 
         @Override
         public DataWriter<InternalRow> createWriter(int partitionId, long taskId) {
-            return new TaskDataWriter(taskId, params, segmentSpec);
+            return new TaskDataWriter(taskId, params, segmentSpec, isAppend);
         }
     }
 }
