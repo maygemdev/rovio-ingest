@@ -37,10 +37,9 @@ class DruidDataSourceWriter implements BatchWrite {
     private final WriterContext param;
     private final SegmentSpec segmentSpec;
     private final MetadataUpdater metadataUpdater;
-    private final boolean isAppend;
 
-    DruidDataSourceWriter(StructType schema, WriterContext param, boolean isAppend) {
-        if (param.isInitDataSource() && isAppend) {
+    DruidDataSourceWriter(StructType schema, WriterContext param) {
+        if (param.isInitDataSource() && param.isAppend()) {
             // in append mode we don't know all "active" segments, thus can't properly mark other segments as unused
             throw new IllegalStateException("Init database with Append write mode is not supported");
         }
@@ -49,12 +48,11 @@ class DruidDataSourceWriter implements BatchWrite {
                 param.getSegmentGranularity(), param.getQueryGranularity(), schema, param.isRollup(),
                 param.getDimensionsSpec(), param.getMetricsSpec(), param.getTransformSpec());
         this.metadataUpdater = new MetadataUpdater(param);
-        this.isAppend = isAppend;
     }
 
     @Override
     public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo physicalWriteInfo) {
-        return new TaskWriterFactory(param, segmentSpec, isAppend);
+        return new TaskWriterFactory(param, segmentSpec);
     }
 
     @Override
@@ -101,17 +99,15 @@ class DruidDataSourceWriter implements BatchWrite {
 
         private final WriterContext params;
         private final SegmentSpec segmentSpec;
-        private final boolean isAppend;
 
-        TaskWriterFactory(WriterContext params, SegmentSpec segmentSpec, boolean isAppend) {
+        TaskWriterFactory(WriterContext params, SegmentSpec segmentSpec) {
             this.params = params;
             this.segmentSpec = segmentSpec;
-            this.isAppend = isAppend;
         }
 
         @Override
         public DataWriter<InternalRow> createWriter(int partitionId, long taskId) {
-            return new TaskDataWriter(taskId, params, segmentSpec, isAppend);
+            return new TaskDataWriter(taskId, params, segmentSpec);
         }
     }
 }

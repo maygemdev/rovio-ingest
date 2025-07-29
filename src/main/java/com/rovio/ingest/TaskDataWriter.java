@@ -103,19 +103,17 @@ class TaskDataWriter implements DataWriter<InternalRow> {
     private final File basePersistDirectory;
     private final WriterContext context;
     private final MetadataUpdater metadataUpdater;
-    private final boolean isAppend;
     private final Map<Interval, VersionWithPartitionNum> intervalVersionMap;
 
     private SegmentIdWithShardSpec current;
 
-    TaskDataWriter(long taskId, WriterContext context, SegmentSpec segmentSpec, boolean isAppend) {
+    TaskDataWriter(long taskId, WriterContext context, SegmentSpec segmentSpec) {
         this.taskId = taskId;
         this.segmentSpec = segmentSpec;
         this.maxRows = context.getSegmentMaxRows();
         this.dataSchema = segmentSpec.getDataSchema();
         this.context = context;
-        this.metadataUpdater = isAppend ? new MetadataUpdater(context) : null; // don't make a connection if it's overwrite (we will not need it)
-        this.isAppend = isAppend;
+        this.metadataUpdater = context.isAppend() ? new MetadataUpdater(context) : null; // don't make a connection if it's overwrite (we will not need it)
 
         this.tuningConfig = getTuningConfig(context);
         DataSegmentPusher segmentPusher = SegmentStorageUpdater.createPusher(context);
@@ -285,7 +283,7 @@ class TaskDataWriter implements DataWriter<InternalRow> {
     }
 
     private SegmentIdWithShardSpec newSegmentId(Interval interval, int partitionNum) {
-        if (isAppend) {
+        if (context.isAppend()) {
             VersionWithPartitionNum versionWithPartitionNum = intervalVersionMap.computeIfAbsent(interval, (k) -> {
                 List<SegmentId> segmentIds = metadataUpdater.findUsedSegments(dataSchema.getDataSource(), interval).stream()
                         .map(s -> SegmentId.tryParse(dataSchema.getDataSource(), s))

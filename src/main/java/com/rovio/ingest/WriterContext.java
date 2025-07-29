@@ -84,6 +84,7 @@ public class WriterContext implements Serializable {
     private final String dimensionsSpec;
     private final String metricsSpec;
     private final String transformSpec;
+    private final boolean isAppend;
 
     private WriterContext(CaseInsensitiveStringMap options, String version) {
         this.dataSource = getOrThrow(options, ConfKeys.DATA_SOURCE);
@@ -163,10 +164,73 @@ public class WriterContext implements Serializable {
                         ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START, ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END));
             }
         }
+
+        this.isAppend = true;
+    }
+
+    private WriterContext(WriterContext context) {
+        this.dataSource = context.dataSource;
+        this.timeColumn = context.timeColumn;
+        this.segmentGranularity = context.segmentGranularity;
+        this.queryGranularity = context.queryGranularity;
+        this.bitmapFactory = context.bitmapFactory;
+        this.excludedDimensions = context.excludedDimensions;
+        this.segmentMaxRows = context.segmentMaxRows;
+        this.maxRowsInMemory = context.maxRowsInMemory;
+
+        this.metadataDbType = context.metadataDbType;
+        this.metadataDbUri = context.metadataDbUri;
+        this.metadataDbUser = context.metadataDbUser;
+        this.metadataDbPass = context.metadataDbPass;
+        this.metadataDbTableBase = context.metadataDbTableBase;
+
+        this.s3Bucket = context.s3Bucket;
+        this.s3BaseKey = context.s3BaseKey;
+        this.s3DisableAcl = context.s3DisableAcl;
+        this.localDir = context.localDir;
+        this.hdfsDir = context.hdfsDir;
+        this.hdfsCoreSitePath = context.hdfsCoreSitePath;
+        this.hdfsHdfsSitePath = context.hdfsHdfsSitePath;
+        this.hdfsDefaultFS = context.hdfsDefaultFS;
+        this.hdfsSecurityKerberosPrincipal = context.hdfsSecurityKerberosPrincipal;
+        this.hdfsSecurityKerberosKeytab = context.hdfsSecurityKerberosKeytab;
+        this.azureAccount = context.azureAccount;
+        this.azureKey = context.azureKey;
+        this.azureSharedAccessStorageToken = context.azureSharedAccessStorageToken;
+        this.azureUseAzureCredentialsChain = context.azureUseAzureCredentialsChain;
+        this.azureContainer = context.azureContainer;
+        this.azurePrefix = context.azurePrefix;
+        this.azureProtocol = context.azureProtocol;
+        this.azureMaxTries = context.azureMaxTries;
+        this.azureMaxListingLength = context.azureMaxListingLength;
+        this.azureEndpointSuffix = context.azureEndpointSuffix;
+        this.azureManagedIdentityClientId = context.azureManagedIdentityClientId;
+
+        this.deepStorageType = context.deepStorageType;
+
+        this.initDataSource = context.initDataSource;
+        this.rollup = context.rollup;
+        this.useDefaultValueForNull = context.useDefaultValueForNull;
+        this.useThreeValueLogicForNativeFilters = context.useThreeValueLogicForNativeFilters;
+        this.dimensionsSpec = context.dimensionsSpec;
+        this.metricsSpec = context.metricsSpec;
+        this.transformSpec = context.transformSpec;
+
+        this.version = context.version;
+
+        this.overwriteAppend = context.overwriteAppend;
+        this.overwriteAppendPartitionNumStart = context.overwriteAppendPartitionNumStart;
+        this.overwriteAppendPartitionNumEnd = context.overwriteAppendPartitionNumEnd;
+
+        this.isAppend = false;
     }
 
     public static WriterContext from(CaseInsensitiveStringMap options, String version) {
         return new WriterContext(options, version);
+    }
+
+    public static WriterContext copyForOverwrite(WriterContext context) {
+        return new WriterContext(context);
     }
 
     private static String getOrThrow(CaseInsensitiveStringMap options, String key) {
@@ -371,6 +435,10 @@ public class WriterContext implements Serializable {
 
     public String getTransformSpec() {
         return transformSpec;
+    }
+
+    public boolean isAppend() {
+        return isAppend;
     }
 
     public static class ConfKeys {
