@@ -50,7 +50,8 @@ public class MetadataUpdater {
     private static final String SELECT_UNUSED_OLD_SEGMENTS =
             "SELECT id FROM %1$s WHERE dataSource = :dataSource AND version < :version AND used = true AND id NOT IN (:ids)";
     private static final String SELECT_USED_SEGMENT_IDS_BY_INTERVAL =
-            "SELECT id FROM %1$s WHERE dataSource = :dataSource AND start = :start AND %2$send%2$s = :end AND used = true";
+            "SELECT id FROM %1$s WHERE dataSource = :dataSource AND start = :start AND %2$send%2$s = :end AND used = true " +
+                    "AND version = (SELECT MAX(version) FROM %1$s WHERE dataSource = :dataSource AND start = :start AND %2$send%2$s = :end AND used = true)";
     private static final String MARK_SEGMENT_AS_UNUSED_BY_ID =
             "UPDATE %1$s SET used=false WHERE id = :id";
 
