@@ -20,7 +20,7 @@ import com.google.common.collect.ImmutableMap;
 import com.rovio.ingest.WriterContext;
 import com.rovio.ingest.model.DbType;
 import org.apache.commons.lang3.StringUtils;
-import org.apache.druid.indexer.SQLMetadataStorageUpdaterJobHandler;
+import org.apache.druid.java.util.common.DateTimes;
 import org.apache.druid.metadata.MetadataStorageConnectorConfig;
 import org.apache.druid.metadata.MetadataStorageTablesConfig;
 import org.apache.druid.metadata.SQLMetadataConnector;
@@ -31,11 +31,14 @@ import org.apache.druid.metadata.storage.postgresql.PostgreSQLConnector;
 import org.apache.druid.metadata.storage.postgresql.PostgreSQLConnectorConfig;
 import org.apache.druid.metadata.storage.postgresql.PostgreSQLTablesConfig;
 import org.apache.druid.timeline.DataSegment;
+import org.apache.druid.timeline.partition.NoneShardSpec;
+import org.joda.time.Interval;
 import org.skife.jdbi.v2.PreparedBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
@@ -46,6 +49,9 @@ public class MetadataUpdater {
 
     private static final String SELECT_UNUSED_OLD_SEGMENTS =
             "SELECT id FROM %1$s WHERE dataSource = :dataSource AND version < :version AND used = true AND id NOT IN (:ids)";
+    private static final String SELECT_USED_SEGMENT_IDS_BY_INTERVAL =
+            "SELECT id FROM %1$s WHERE dataSource = :dataSource AND start = :start AND %2$send%2$s = :end AND used = true " +
+                    "AND version = (SELECT MAX(version) FROM %1$s WHERE dataSource = :dataSource AND start = :start AND %2$send%2$s = :end AND used = true)";
     private static final String MARK_SEGMENT_AS_UNUSED_BY_ID =
             "UPDATE %1$s SET used=false WHERE id = :id";
 
@@ -54,7 +60,6 @@ public class MetadataUpdater {
     private final boolean initDataSource;
     private final SQLMetadataConnector sqlConnector;
     private final String segmentsTable;
-    private final SQLMetadataStorageUpdaterJobHandler metadataStorageUpdaterJobHandler;
 
     public MetadataUpdater(WriterContext param) {
         Preconditions.checkNotNull(param);
@@ -83,7 +88,6 @@ public class MetadataUpdater {
 
         final DbType dbType = DbType.from(param.getMetadataDbType());
         this.sqlConnector = this.makeSqlConnector(dbType, metadataStorageConnectorConfig, metadataStorageTablesConfig);
-        this.metadataStorageUpdaterJobHandler = new SQLMetadataStorageUpdaterJobHandler(sqlConnector);
 
         testDbConnection();
     }
@@ -118,13 +122,60 @@ public class MetadataUpdater {
      * Updates segments in Metadata segment table using {@link org.apache.druid.indexer.SQLMetadataStorageUpdaterJobHandler#publishSegments},
      * with additional handling for (re-)init.
      */
-    public void publishSegments(List<DataSegment> dataSegments) {
-        if (dataSegments.isEmpty()) {
+    public void publishSegments(List<DataSegment> addedSegments, Set<String> segmentsToMarkUnused) {
+        if (addedSegments.isEmpty() && segmentsToMarkUnused.isEmpty()) {
             LOG.warn("No segments created, skipping metadata update.");
             return;
         }
 
-        metadataStorageUpdaterJobHandler.publishSegments(segmentsTable, dataSegments, MAPPER);
+        sqlConnector.getDBI().inTransaction((handle, status) -> {
+            if (!addedSegments.isEmpty()) {
+                // borrowed from org.apache.druid.indexer.SQLMetadataStorageUpdaterJobHandler
+                // used as copy/paste to support transactional segments update
+                final PreparedBatch batch = handle.prepareBatch(
+                        org.apache.druid.java.util.common.StringUtils.format(
+                                "INSERT INTO %1$s (id, dataSource, created_date, start, %2$send%2$s, partitioned, version, used, payload, used_status_last_updated) "
+                                        + "VALUES (:id, :dataSource, :created_date, :start, :end, :partitioned, :version, :used, :payload, :used_status_last_updated)",
+                                segmentsTable, sqlConnector.getQuoteString()
+                        )
+                );
+                for (final DataSegment segment : addedSegments) {
+                    String now = DateTimes.nowUtc().toString();
+                    batch.add(
+                            new ImmutableMap.Builder<String, Object>()
+                                    .put("id", segment.getId().toString())
+                                    .put("dataSource", segment.getDataSource())
+                                    .put("created_date", now)
+                                    .put("start", segment.getInterval().getStart().toString())
+                                    .put("end", segment.getInterval().getEnd().toString())
+                                    .put("partitioned", (segment.getShardSpec() instanceof NoneShardSpec) ? false : true)
+                                    .put("version", segment.getVersion())
+                                    .put("used", true)
+                                    .put("payload", MAPPER.writeValueAsBytes(segment))
+                                    .put("used_status_last_updated", now)
+                                    .build()
+                    );
+                    LOG.info("Published {}", segment.getId());
+                }
+                batch.execute();
+            }
+
+            if (!segmentsToMarkUnused.isEmpty()) {
+                PreparedBatch batch = handle.prepareBatch(String.format(MARK_SEGMENT_AS_UNUSED_BY_ID, segmentsTable));
+                for (String id : segmentsToMarkUnused) {
+                    batch.add(new ImmutableMap.Builder<String, Object>()
+                            .put("id", id)
+                            .build());
+
+                    LOG.info("Marking {} segment as ununsed", id);
+                }
+                batch.execute();
+            }
+
+            return null;
+        });
+
+
         LOG.info("All segments published");
 
         if (initDataSource) {
@@ -140,8 +191,7 @@ public class MetadataUpdater {
                         .bind("dataSource", dataSource)
                         .bind("version", version)
                         .bind("ids",
-                                dataSegments
-                                        .stream()
+                                addedSegments.stream()
                                         .map(d -> StringUtils.wrap(d.getId().toString(), "'"))
                                         .collect(Collectors.joining(",")))
                         .list()
@@ -165,5 +215,19 @@ public class MetadataUpdater {
             });
 
         }
+    }
+
+    public List<String> findUsedSegments(String dataSource, Interval interval) {
+        // here we assume that all used segments for given interval have same version
+        return sqlConnector.getDBI().withHandle(handle -> {
+            return handle.createQuery(String.format(SELECT_USED_SEGMENT_IDS_BY_INTERVAL, segmentsTable, sqlConnector.getQuoteString()))
+                    .bind("dataSource", dataSource)
+                    .bind("start", interval.getStart().toString())
+                    .bind("end", interval.getEnd().toString())
+                    .list()
+                    .stream()
+                    .map(m -> m.get("id").toString())
+                    .collect(Collectors.toList());
+        });
     }
 }

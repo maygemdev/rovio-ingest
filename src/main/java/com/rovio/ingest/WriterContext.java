@@ -78,9 +78,13 @@ public class WriterContext implements Serializable {
     private final boolean rollup;
     private final boolean useDefaultValueForNull;
     private final boolean useThreeValueLogicForNativeFilters;
+    private final boolean overwriteAppend;
+    private final int overwriteAppendPartitionNumStart;
+    private final int overwriteAppendPartitionNumEnd;
     private final String dimensionsSpec;
     private final String metricsSpec;
     private final String transformSpec;
+    private final boolean isAppend;
 
     private WriterContext(CaseInsensitiveStringMap options, String version) {
         this.dataSource = getOrThrow(options, ConfKeys.DATA_SOURCE);
@@ -144,10 +148,89 @@ public class WriterContext implements Serializable {
         this.transformSpec = options.getOrDefault(ConfKeys.TRANSFORM_SPEC, null);
 
         this.version = version;
+
+        this.overwriteAppend = options.getBoolean(ConfKeys.OVERWRITE_APPEND, false);
+        this.overwriteAppendPartitionNumStart = options.getInt(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START, -1);
+        this.overwriteAppendPartitionNumEnd = options.getInt(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END, -1);
+        if (this.overwriteAppend) {
+            if (this.overwriteAppendPartitionNumStart <= 0) {
+                throw missingKeyError(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START);
+            }
+            if (this.overwriteAppendPartitionNumEnd <= 0) {
+                throw missingKeyError(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END);
+            }
+            if (this.overwriteAppendPartitionNumStart >= this.overwriteAppendPartitionNumEnd) {
+                throw new IllegalArgumentException(format("\"%s\" should be less than \"%s\"",
+                        ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START, ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END));
+            }
+        }
+
+        this.isAppend = true;
+    }
+
+    private WriterContext(WriterContext context) {
+        this.dataSource = context.dataSource;
+        this.timeColumn = context.timeColumn;
+        this.segmentGranularity = context.segmentGranularity;
+        this.queryGranularity = context.queryGranularity;
+        this.bitmapFactory = context.bitmapFactory;
+        this.excludedDimensions = context.excludedDimensions;
+        this.segmentMaxRows = context.segmentMaxRows;
+        this.maxRowsInMemory = context.maxRowsInMemory;
+
+        this.metadataDbType = context.metadataDbType;
+        this.metadataDbUri = context.metadataDbUri;
+        this.metadataDbUser = context.metadataDbUser;
+        this.metadataDbPass = context.metadataDbPass;
+        this.metadataDbTableBase = context.metadataDbTableBase;
+
+        this.s3Bucket = context.s3Bucket;
+        this.s3BaseKey = context.s3BaseKey;
+        this.s3DisableAcl = context.s3DisableAcl;
+        this.localDir = context.localDir;
+        this.hdfsDir = context.hdfsDir;
+        this.hdfsCoreSitePath = context.hdfsCoreSitePath;
+        this.hdfsHdfsSitePath = context.hdfsHdfsSitePath;
+        this.hdfsDefaultFS = context.hdfsDefaultFS;
+        this.hdfsSecurityKerberosPrincipal = context.hdfsSecurityKerberosPrincipal;
+        this.hdfsSecurityKerberosKeytab = context.hdfsSecurityKerberosKeytab;
+        this.azureAccount = context.azureAccount;
+        this.azureKey = context.azureKey;
+        this.azureSharedAccessStorageToken = context.azureSharedAccessStorageToken;
+        this.azureUseAzureCredentialsChain = context.azureUseAzureCredentialsChain;
+        this.azureContainer = context.azureContainer;
+        this.azurePrefix = context.azurePrefix;
+        this.azureProtocol = context.azureProtocol;
+        this.azureMaxTries = context.azureMaxTries;
+        this.azureMaxListingLength = context.azureMaxListingLength;
+        this.azureEndpointSuffix = context.azureEndpointSuffix;
+        this.azureManagedIdentityClientId = context.azureManagedIdentityClientId;
+
+        this.deepStorageType = context.deepStorageType;
+
+        this.initDataSource = context.initDataSource;
+        this.rollup = context.rollup;
+        this.useDefaultValueForNull = context.useDefaultValueForNull;
+        this.useThreeValueLogicForNativeFilters = context.useThreeValueLogicForNativeFilters;
+        this.dimensionsSpec = context.dimensionsSpec;
+        this.metricsSpec = context.metricsSpec;
+        this.transformSpec = context.transformSpec;
+
+        this.version = context.version;
+
+        this.overwriteAppend = context.overwriteAppend;
+        this.overwriteAppendPartitionNumStart = context.overwriteAppendPartitionNumStart;
+        this.overwriteAppendPartitionNumEnd = context.overwriteAppendPartitionNumEnd;
+
+        this.isAppend = false;
     }
 
     public static WriterContext from(CaseInsensitiveStringMap options, String version) {
         return new WriterContext(options, version);
+    }
+
+    public static WriterContext copyForOverwrite(WriterContext context) {
+        return new WriterContext(context);
     }
 
     private static String getOrThrow(CaseInsensitiveStringMap options, String key) {
@@ -155,7 +238,11 @@ public class WriterContext implements Serializable {
             return options.get(key);
         }
 
-        throw new IllegalArgumentException(format("Missing mandatory \"%s\" option", key));
+        throw missingKeyError(key);
+    }
+
+    private static IllegalArgumentException missingKeyError(String key) {
+        return new IllegalArgumentException(format("Missing mandatory \"%s\" option", key));
     }
 
     public String getDataSource() {
@@ -326,6 +413,18 @@ public class WriterContext implements Serializable {
         return useThreeValueLogicForNativeFilters;
     }
 
+    public boolean isOverwriteAppend() {
+        return overwriteAppend;
+    }
+
+    public int getOverwriteAppendPartitionNumStart() {
+        return overwriteAppendPartitionNumStart;
+    }
+
+    public int getOverwriteAppendPartitionNumEnd() {
+        return overwriteAppendPartitionNumEnd;
+    }
+
     public String getDimensionsSpec() {
         return dimensionsSpec;
     }
@@ -336,6 +435,10 @@ public class WriterContext implements Serializable {
 
     public String getTransformSpec() {
         return transformSpec;
+    }
+
+    public boolean isAppend() {
+        return isAppend;
     }
 
     public static class ConfKeys {
@@ -355,6 +458,9 @@ public class WriterContext implements Serializable {
         public static final String SEGMENT_ROLLUP = "druid.segment.rollup";
         public static final String USE_DEFAULT_VALUES_FOR_NULL = "druid.use_default_values_for_null";
         public static final String USE_THREE_VALUE_LOGIC_FOR_NATIVE_FILTERS = "druid.use_three_value_logic_for_native_filters";
+        public static final String OVERWRITE_APPEND = "druid.overwrite_append";
+        public static final String OVERWRITE_APPEND_PARTITION_NUM_START = "druid.overwrite_append_partition_num_start";
+        public static final String OVERWRITE_APPEND_PARTITION_NUM_END = "druid.overwrite_append_partition_num_end";
         // Metadata config
         public static final String METADATA_DB_TYPE = "druid.metastore.db.type";
         public static final String METADATA_DB_URI = "druid.metastore.db.uri";
