@@ -40,9 +40,8 @@ import java.util.Map;
 
 import static com.rovio.ingest.WriterContext.ConfKeys.DATASOURCE_INIT;
 import static com.rovio.ingest.WriterContext.ConfKeys.METRICS_SPEC;
-import static com.rovio.ingest.WriterContext.ConfKeys.OVERWRITE_APPEND;
-import static com.rovio.ingest.WriterContext.ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END;
-import static com.rovio.ingest.WriterContext.ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START;
+import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_END;
+import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_START;
 import static com.rovio.ingest.WriterContext.ConfKeys.QUERY_GRANULARITY;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_GRANULARITY;
 import static org.apache.spark.sql.functions.column;
@@ -555,7 +554,7 @@ public class DruidDatasetExtensionsTest extends DruidSourceBaseTest {
     }
 
     @Test
-    public void saveWithPartitionedByTimeWithAppendOverrideAndThenAppendWriteMode() throws IOException {
+    public void saveWithPartitionedByTimeWithAppendWithPartitionNumStartEndAndThenOverwriteWriteMode() throws IOException {
         Dataset<Row> dataset = loadCsv(spark, "/data.csv");
         dataset = DruidDatasetExtensions.repartitionByDruidSegmentSize(dataset, "date", "DAY", 5000000, false);
         dataset.show(false);
@@ -573,9 +572,8 @@ public class DruidDatasetExtensionsTest extends DruidSourceBaseTest {
 
         DateTimeUtils.setCurrentMillisFixed(VERSION_TIME_MILLIS + 60_000);
 
-        options.put(OVERWRITE_APPEND, "true");
-        options.put(OVERWRITE_APPEND_PARTITION_NUM_START, "1000");
-        options.put(OVERWRITE_APPEND_PARTITION_NUM_END, "2000");
+        options.put(PARTITION_NUM_START, "1000");
+        options.put(PARTITION_NUM_END, "2000");
         dataset.write()
                 .format(DruidSource.FORMAT)
                 .mode(SaveMode.Append)
@@ -593,25 +591,25 @@ public class DruidDatasetExtensionsTest extends DruidSourceBaseTest {
         Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(3).getIntervalEnd().toString());
         Assertions.assertEquals(1000, segmentIds.get(3).getPartitionNum());
 
-        options.put(OVERWRITE_APPEND, "false");
         DateTimeUtils.setCurrentMillisFixed(VERSION_TIME_MILLIS + 120_000);
         dataset.write()
                 .format(DruidSource.FORMAT)
-                .mode(SaveMode.Append)
+                .mode(SaveMode.Overwrite)
                 .options(options)
                 .save();
 
-        verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 3, false);
-        segmentIds = verifySegmentTable(interval, version, true, 6);
-        Assertions.assertEquals(0, segmentIds.get(0).getPartitionNum());
+        verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 2, false);
+        verifySegmentTable(interval, version, true, 4);
+
+        String secondVersion = DateTime.now(ISOChronology.getInstanceUTC()).toString();
+        verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, secondVersion, 1, false);
+
+        segmentIds = verifySegmentTable(interval, secondVersion, true, 2);
+        Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(0).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(0).getIntervalEnd().toString());
+        Assertions.assertEquals(1000, segmentIds.get(0).getPartitionNum());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
         Assertions.assertEquals(1000, segmentIds.get(1).getPartitionNum());
-        Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(2).getIntervalStart().toString());
-        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(2).getIntervalEnd().toString());
-        Assertions.assertEquals(1001, segmentIds.get(2).getPartitionNum());
-        Assertions.assertEquals(0, segmentIds.get(3).getPartitionNum());
-        Assertions.assertEquals(1000, segmentIds.get(4).getPartitionNum());
-        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(5).getIntervalStart().toString());
-        Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(5).getIntervalEnd().toString());
-        Assertions.assertEquals(1001, segmentIds.get(5).getPartitionNum());
     }
 }

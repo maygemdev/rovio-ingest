@@ -98,7 +98,6 @@ class TaskDataWriter implements DataWriter<InternalRow> {
     private final Appenderator appenderator;
     private final DataSegmentKiller segmentKiller;
     private final Supplier<Committer> committerSupplier;
-    private final Set<String> segmentsToMarkUnused;
     private final Set<DataSegment> pushedSegments;
     private final File basePersistDirectory;
     private final WriterContext context;
@@ -126,7 +125,6 @@ class TaskDataWriter implements DataWriter<InternalRow> {
         this.appenderator = new DefaultOfflineAppenderatorFactory(segmentPusher, MAPPER, INDEX_IO, INDEX_MERGER_V_9)
                 .build(dataSchema, tuningConfig.withBasePersistDirectory(basePersistDirectory), new FireDepartmentMetrics());
         this.committerSupplier = Committers::nil;
-        this.segmentsToMarkUnused = new HashSet<>();
         this.pushedSegments = new HashSet<>();
         this.intervalVersionMap = new HashMap<>();
         this.appenderator.startJob();
@@ -192,7 +190,7 @@ class TaskDataWriter implements DataWriter<InternalRow> {
             List<SegmentIdWithShardSpec> toPush = appenderator.getSegments();
             pushSegments(toPush);
             LOG.info("Commit taskId = {}, pushedSegments={}", taskId, pushedSegments.size());
-            return DataSegmentCommitMessage.getInstance(new ArrayList<>(pushedSegments), segmentsToMarkUnused);
+            return DataSegmentCommitMessage.getInstance(pushedSegments);
         } finally {
             appenderator.close();
         }
@@ -283,58 +281,47 @@ class TaskDataWriter implements DataWriter<InternalRow> {
     }
 
     private SegmentIdWithShardSpec newSegmentId(Interval interval, int partitionNum) {
+        VersionWithPartitionNum versionWithPartitionNum;
         if (context.isAppend()) {
-            VersionWithPartitionNum versionWithPartitionNum = intervalVersionMap.computeIfAbsent(interval, (k) -> {
+            versionWithPartitionNum = intervalVersionMap.computeIfAbsent(interval, (k) -> {
                 List<SegmentId> segmentIds = metadataUpdater.findUsedSegments(dataSchema.getDataSource(), interval).stream()
                         .map(s -> SegmentId.tryParse(dataSchema.getDataSource(), s))
                         .filter(Objects::nonNull)
                         .collect(Collectors.toList());
 
-                if (context.isOverwriteAppend()) {
-                    Optional<SegmentId> segmentWithMaxPartitionNum = segmentIds.stream()
-                            .filter(s -> s.getPartitionNum() >= context.getOverwriteAppendPartitionNumStart()
-                                    && s.getPartitionNum() < context.getOverwriteAppendPartitionNumEnd())
-                            .peek(s -> segmentsToMarkUnused.add(s.toString()))
-                            .max(Comparator.comparing(SegmentId::getPartitionNum));
+                Optional<SegmentId> segmentWithMaxPartitionNum = segmentIds.stream()
+                        .filter(s -> s.getPartitionNum() >= context.getPartitionNumStart()
+                                     && s.getPartitionNum() < context.getPartitionNumEnd())
+                        .max(Comparator.comparing(SegmentId::getPartitionNum));
 
-                    return segmentWithMaxPartitionNum
-                            .map(s -> new VersionWithPartitionNum(s.getVersion(), s.getPartitionNum() + 1))
-                            .orElseGet(() -> {
-                                // if we have used segment not within specified offset range
-                                // we should still use its version to make sure segments will be appended
-                                String version = segmentIds.isEmpty()
-                                        ? tuningConfig.getVersioningPolicy().getVersion(interval)
-                                        : segmentIds.get(0).getVersion();
-                                return new VersionWithPartitionNum(version, context.getOverwriteAppendPartitionNumStart());
-                            });
-                } else {
-                    return segmentIds.stream()
-                            .max(Comparator.comparing(SegmentId::getPartitionNum))
-                            .map(s -> new VersionWithPartitionNum(s.getVersion(), s.getPartitionNum() + 1))
-                            .orElseGet(() -> new VersionWithPartitionNum(tuningConfig.getVersioningPolicy().getVersion(interval), 0));
-                }
+                return segmentWithMaxPartitionNum
+                        .map(s -> new VersionWithPartitionNum(s.getVersion(), s.getPartitionNum() + 1))
+                        .orElseGet(() -> {
+                            // if we have used segment not within specified offset range
+                            // we should still use its version to make sure segments will be appended
+                            String version = segmentIds.isEmpty()
+                                    ? tuningConfig.getVersioningPolicy().getVersion(interval)
+                                    : segmentIds.get(0).getVersion();
+                            return new VersionWithPartitionNum(version, context.getPartitionNumStart());
+                        });
             });
-
-            int segmentPartitionNum = versionWithPartitionNum.maxPartitionNum + partitionNum;
-            if (context.isOverwriteAppend() && segmentPartitionNum >= context.getOverwriteAppendPartitionNumEnd()) {
-                throw new IllegalStateException(String.format("Partition nums have just reached its end = %d",
-                        context.getOverwriteAppendPartitionNumEnd()));
-            }
-
-            return new SegmentIdWithShardSpec(
-                    dataSchema.getDataSource(),
-                    interval,
-                    versionWithPartitionNum.version,
-                    new LinearShardSpec(segmentPartitionNum)
-            );
         } else {
-            return new SegmentIdWithShardSpec(
-                    dataSchema.getDataSource(),
-                    interval,
-                    tuningConfig.getVersioningPolicy().getVersion(interval),
-                    new LinearShardSpec(partitionNum)
-            );
+            versionWithPartitionNum = new VersionWithPartitionNum(
+                    tuningConfig.getVersioningPolicy().getVersion(interval), context.getPartitionNumStart());
         }
+
+        int segmentPartitionNum = versionWithPartitionNum.maxPartitionNum + partitionNum;
+        if (segmentPartitionNum >= context.getPartitionNumEnd()) {
+            throw new IllegalStateException(String.format("Partition nums have just reached its end = %d",
+                    context.getPartitionNumEnd()));
+        }
+
+        return new SegmentIdWithShardSpec(
+                dataSchema.getDataSource(),
+                interval,
+                versionWithPartitionNum.version,
+                new LinearShardSpec(segmentPartitionNum)
+        );
     }
 
     private void pushSegments(List<SegmentIdWithShardSpec> toPush) throws IOException {
@@ -351,8 +338,7 @@ class TaskDataWriter implements DataWriter<InternalRow> {
                 appenderator.drop(identifier).get();
             }
             pushedSegments.addAll(updated);
-            LOG.info("TaskId={}, pushed segments {}, unused segments {}",
-                    taskId, pushedSegments.size(), segmentsToMarkUnused.size());
+            LOG.info("TaskId={}, pushed segments {}", taskId, pushedSegments.size());
         } catch (InterruptedException | ExecutionException e) {
             throw new IOException("Failed to push segment", e);
         }

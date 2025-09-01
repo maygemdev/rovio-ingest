@@ -40,9 +40,8 @@ import java.util.List;
 
 import static com.rovio.ingest.WriterContext.ConfKeys.DATASOURCE_INIT;
 import static com.rovio.ingest.WriterContext.ConfKeys.EXCLUDED_DIMENSIONS;
-import static com.rovio.ingest.WriterContext.ConfKeys.OVERWRITE_APPEND;
-import static com.rovio.ingest.WriterContext.ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END;
-import static com.rovio.ingest.WriterContext.ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START;
+import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_END;
+import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_START;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_GRANULARITY;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_MAX_ROWS;
 import static org.apache.spark.sql.functions.callUDF;
@@ -78,8 +77,7 @@ public class DruidSourceTest extends DruidSourceBaseTest {
     }
 
     @Test
-    public void failForInvalidOptionsForAppendWriteModeWithOverrideAppend() {
-        options.put(OVERWRITE_APPEND, "true");
+    public void failForInvalidPartitionNumStartEndOptions() {
         Executable runJob = () -> loadCsv(spark, "/data.csv")
                 .write()
                 .format("com.rovio.ingest.DruidSource")
@@ -87,17 +85,19 @@ public class DruidSourceTest extends DruidSourceBaseTest {
                 .options(options)
                 .save();
 
+        options.put(PARTITION_NUM_START, "-1");
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class, runJob);
-        assertThat(thrown.getMessage(), containsString("Missing mandatory \"druid.overwrite_append_partition_num_start\" option"));
+        assertThat(thrown.getMessage(), containsString("\"druid.partition_num_start\" should be >= 0"));
 
-        options.put(OVERWRITE_APPEND_PARTITION_NUM_START, "1000");
+        options.put(PARTITION_NUM_START, "1000");
+        options.put(PARTITION_NUM_END, "0");
         thrown = assertThrows(IllegalArgumentException.class, runJob);
-        assertThat(thrown.getMessage(), containsString("Missing mandatory \"druid.overwrite_append_partition_num_end\" option"));
+        assertThat(thrown.getMessage(), containsString("\"druid.partition_num_end\" should be > 0"));
 
-        options.put(OVERWRITE_APPEND_PARTITION_NUM_END, "1000");
+        options.put(PARTITION_NUM_END, "1000");
         thrown = assertThrows(IllegalArgumentException.class, runJob);
-        assertThat(thrown.getMessage(), containsString("\"druid.overwrite_append_partition_num_start\" should be " +
-                "less than \"druid.overwrite_append_partition_num_end\""));
+        assertThat(thrown.getMessage(),
+                containsString("\"druid.partition_num_start\" should be less than \"druid.partition_num_end\""));
     }
 
     @Test
@@ -203,10 +203,9 @@ public class DruidSourceTest extends DruidSourceBaseTest {
     }
 
     @Test
-    public void passWhenPartitionedByTimeWithAppendWriteModeAndOverwriteAppendFlag() throws IOException {
-        options.put(OVERWRITE_APPEND, "true");
-        options.put(OVERWRITE_APPEND_PARTITION_NUM_START, "1000");
-        options.put(OVERWRITE_APPEND_PARTITION_NUM_END, "2000");
+    public void passWhenPartitionedByTimeWithAppendWriteModeAndPartitionNumStartEnd() throws IOException {
+        options.put(PARTITION_NUM_START, "1000");
+        options.put(PARTITION_NUM_END, "2000");
 
         Dataset<Row> dataset = loadCsv(spark, "/data.csv");
         dataset = dataset.repartition(column("date"));
@@ -238,14 +237,15 @@ public class DruidSourceTest extends DruidSourceBaseTest {
                 .save();
 
         verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 2, false);
-        verifySegmentTable(interval, version, false, 2);
-        segmentIds = verifySegmentTable(interval, version, true, 2);
-        Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(0).getIntervalStart().toString());
-        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(0).getIntervalEnd().toString());
-        Assertions.assertEquals(1001, segmentIds.get(0).getPartitionNum());
-        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
-        Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
+        segmentIds = verifySegmentTable(interval, version, true, 4);
+        Assertions.assertEquals(1000, segmentIds.get(0).getPartitionNum());
+        Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
         Assertions.assertEquals(1001, segmentIds.get(1).getPartitionNum());
+        Assertions.assertEquals(1000, segmentIds.get(2).getPartitionNum());
+        Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(3).getIntervalStart().toString());
+        Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(3).getIntervalEnd().toString());
+        Assertions.assertEquals(1001, segmentIds.get(3).getPartitionNum());
     }
 
     @Test
@@ -343,7 +343,7 @@ public class DruidSourceTest extends DruidSourceBaseTest {
     }
 
     @Test
-    public void passForDayGranularityWithMaxRowsAndAppendOverrideFlagExceedingPartitionNumEnd() throws IOException {
+    public void passForDayGranularityWithMaxRowsAndPartitionNumEndExceeded() throws IOException {
         Dataset<Row> dataset = loadCsv(spark, "/data.csv");
         List<Column> columns = Lists.newArrayList(unix_timestamp(column("date")).multiply(1000), lit("DAY"));
         dataset = dataset.withColumn("__partition",
@@ -355,9 +355,8 @@ public class DruidSourceTest extends DruidSourceBaseTest {
 
         options.put(EXCLUDED_DIMENSIONS, "__partition");
         options.put(SEGMENT_MAX_ROWS, String.valueOf(1));
-        options.put(OVERWRITE_APPEND, "true");
-        options.put(OVERWRITE_APPEND_PARTITION_NUM_START, "10");
-        options.put(OVERWRITE_APPEND_PARTITION_NUM_END, "18");
+        options.put(PARTITION_NUM_START, "10");
+        options.put(PARTITION_NUM_END, "18");
         SparkException thrown = assertThrows(SparkException.class,
                 () -> newDataset.write()
                         .format("com.rovio.ingest.DruidSource")

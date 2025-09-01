@@ -39,8 +39,6 @@ import org.testcontainers.shaded.com.google.common.collect.ImmutableMap;
 
 import java.sql.SQLException;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -104,7 +102,7 @@ class MetadataUpdaterTest {
                 .interval(interval)
                 .version(version)
                 .build();
-        updater.publishSegments(Arrays.asList(segment), Collections.emptySet());
+        updater.publishSegments(Arrays.asList(segment));
 
         List<Map<String, Object>> result = DBI.open(getConnectionString(jdbc), dbUser, dbPass)
                 .createQuery("select * from " + segmentsTable).list();
@@ -120,12 +118,12 @@ class MetadataUpdaterTest {
 
         updater.publishSegments(Arrays.asList(DataSegment.builder(segment)
                 .shardSpec(new LinearShardSpec(100))
-                .build()), new HashSet<>(Collections.singletonList(segment.getId().toString())));
+                .build()));
 
         result = DBI.open(getConnectionString(jdbc), dbUser, dbPass)
                 .createQuery("select * from " + segmentsTable + " order by id").list();
         row = result.get(0);
-        assertEquals(false, row.get("used"));
+        assertEquals(true, row.get("used"));
 
         row = result.get(1);
         assertEquals("temp", row.get("datasource"));
@@ -138,8 +136,9 @@ class MetadataUpdaterTest {
         assertEquals(true, row.get("used"));
 
         List<String> segments = updater.findUsedSegments(DATA_SOURCE, interval);
-        Assertions.assertEquals(1, segments.size());
-        Assertions.assertEquals("temp_2019-10-16T00:00:00.000Z_2019-10-18T00:00:00.000Z_2019-10-01T20:29:31.384Z_100", segments.get(0));
+        Assertions.assertEquals(2, segments.size());
+        Assertions.assertEquals("temp_2019-10-16T00:00:00.000Z_2019-10-18T00:00:00.000Z_2019-10-01T20:29:31.384Z", segments.get(0));
+        Assertions.assertEquals("temp_2019-10-16T00:00:00.000Z_2019-10-18T00:00:00.000Z_2019-10-01T20:29:31.384Z_100", segments.get(1));
     }
 
 }

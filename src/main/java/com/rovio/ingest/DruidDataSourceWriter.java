@@ -15,7 +15,6 @@
  */
 package com.rovio.ingest;
 
-import com.rovio.ingest.model.ProcessedSegmentData;
 import com.rovio.ingest.model.SegmentSpec;
 import com.rovio.ingest.util.MetadataUpdater;
 import com.rovio.ingest.util.SegmentStorageUpdater;
@@ -30,6 +29,7 @@ import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.StructType;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 class DruidDataSourceWriter implements BatchWrite {
@@ -67,29 +67,29 @@ class DruidDataSourceWriter implements BatchWrite {
 
     @Override
     public final void commit(WriterCommitMessage[] messages) {
-        ProcessedSegmentData dataSegments = toDataSegments(messages);
+        List<DataSegment> dataSegments = toDataSegments(messages);
         if (metadataUpdater != null) {
-            metadataUpdater.publishSegments(dataSegments.getAddedSegments(), dataSegments.getSegmentsToMarkUnused());
+            metadataUpdater.publishSegments(dataSegments);
         }
     }
 
     @Override
     public final void abort(WriterCommitMessage[] messages) {
-        List<DataSegment> dataSegments = toDataSegments(messages).getAddedSegments();
+        List<DataSegment> dataSegments = toDataSegments(messages);
         DataSegmentKiller segmentKiller = SegmentStorageUpdater.createKiller(param);
         dataSegments.forEach(segmentKiller::killQuietly);
     }
 
-    private ProcessedSegmentData toDataSegments(WriterCommitMessage[] messages) {
+    private List<DataSegment> toDataSegments(WriterCommitMessage[] messages) {
         try {
-            ProcessedSegmentData data = new ProcessedSegmentData();
+            List<DataSegment> segments = new ArrayList<>();
             for (WriterCommitMessage message : messages) {
                 DataSegmentCommitMessage segmentCommitMessage = (DataSegmentCommitMessage) message;
                 if (segmentCommitMessage != null) {
-                    data.merge(segmentCommitMessage.getSegments());
+                    segments.addAll(segmentCommitMessage.getSegments());
                 }
             }
-            return data;
+            return segments;
         } catch (IOException e) {
             throw new RuntimeException("Failed to deserialize data segments", e);
         }

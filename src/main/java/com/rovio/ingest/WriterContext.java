@@ -21,6 +21,7 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 
 import static java.lang.String.format;
 
@@ -78,9 +79,8 @@ public class WriterContext implements Serializable {
     private final boolean rollup;
     private final boolean useDefaultValueForNull;
     private final boolean useThreeValueLogicForNativeFilters;
-    private final boolean overwriteAppend;
-    private final int overwriteAppendPartitionNumStart;
-    private final int overwriteAppendPartitionNumEnd;
+    private final int partitionNumStart;
+    private final int partitionNumEnd;
     private final String dimensionsSpec;
     private final String metricsSpec;
     private final String transformSpec;
@@ -149,20 +149,17 @@ public class WriterContext implements Serializable {
 
         this.version = version;
 
-        this.overwriteAppend = options.getBoolean(ConfKeys.OVERWRITE_APPEND, false);
-        this.overwriteAppendPartitionNumStart = options.getInt(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START, -1);
-        this.overwriteAppendPartitionNumEnd = options.getInt(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END, -1);
-        if (this.overwriteAppend) {
-            if (this.overwriteAppendPartitionNumStart <= 0) {
-                throw missingKeyError(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START);
-            }
-            if (this.overwriteAppendPartitionNumEnd <= 0) {
-                throw missingKeyError(ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END);
-            }
-            if (this.overwriteAppendPartitionNumStart >= this.overwriteAppendPartitionNumEnd) {
-                throw new IllegalArgumentException(format("\"%s\" should be less than \"%s\"",
-                        ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_START, ConfKeys.OVERWRITE_APPEND_PARTITION_NUM_END));
-            }
+        this.partitionNumStart = options.getInt(ConfKeys.PARTITION_NUM_START, 0);
+        this.partitionNumEnd = options.getInt(ConfKeys.PARTITION_NUM_END, Integer.MAX_VALUE);
+        if (this.partitionNumStart < 0) {
+            throw new IllegalArgumentException(format("\"%s\" should be >= 0", ConfKeys.PARTITION_NUM_START));
+        }
+        if (this.partitionNumEnd <= 0) {
+            throw new IllegalArgumentException(format("\"%s\" should be > 0", ConfKeys.PARTITION_NUM_END));
+        }
+        if (this.partitionNumStart >= this.partitionNumEnd) {
+            throw new IllegalArgumentException(format("\"%s\" should be less than \"%s\"",
+                    ConfKeys.PARTITION_NUM_START, ConfKeys.PARTITION_NUM_END));
         }
 
         this.isAppend = true;
@@ -218,9 +215,8 @@ public class WriterContext implements Serializable {
 
         this.version = context.version;
 
-        this.overwriteAppend = context.overwriteAppend;
-        this.overwriteAppendPartitionNumStart = context.overwriteAppendPartitionNumStart;
-        this.overwriteAppendPartitionNumEnd = context.overwriteAppendPartitionNumEnd;
+        this.partitionNumStart = context.partitionNumStart;
+        this.partitionNumEnd = context.partitionNumEnd;
 
         this.isAppend = false;
     }
@@ -413,16 +409,12 @@ public class WriterContext implements Serializable {
         return useThreeValueLogicForNativeFilters;
     }
 
-    public boolean isOverwriteAppend() {
-        return overwriteAppend;
+    public int getPartitionNumStart() {
+        return partitionNumStart;
     }
 
-    public int getOverwriteAppendPartitionNumStart() {
-        return overwriteAppendPartitionNumStart;
-    }
-
-    public int getOverwriteAppendPartitionNumEnd() {
-        return overwriteAppendPartitionNumEnd;
+    public int getPartitionNumEnd() {
+        return partitionNumEnd;
     }
 
     public String getDimensionsSpec() {
@@ -458,9 +450,8 @@ public class WriterContext implements Serializable {
         public static final String SEGMENT_ROLLUP = "druid.segment.rollup";
         public static final String USE_DEFAULT_VALUES_FOR_NULL = "druid.use_default_values_for_null";
         public static final String USE_THREE_VALUE_LOGIC_FOR_NATIVE_FILTERS = "druid.use_three_value_logic_for_native_filters";
-        public static final String OVERWRITE_APPEND = "druid.overwrite_append";
-        public static final String OVERWRITE_APPEND_PARTITION_NUM_START = "druid.overwrite_append_partition_num_start";
-        public static final String OVERWRITE_APPEND_PARTITION_NUM_END = "druid.overwrite_append_partition_num_end";
+        public static final String PARTITION_NUM_START = "druid.partition_num_start";
+        public static final String PARTITION_NUM_END = "druid.partition_num_end";
         // Metadata config
         public static final String METADATA_DB_TYPE = "druid.metastore.db.type";
         public static final String METADATA_DB_URI = "druid.metastore.db.uri";

@@ -16,10 +16,10 @@
 package com.rovio.ingest;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.InjectableValues;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.jsontype.NamedType;
-import com.rovio.ingest.model.ProcessedSegmentData;
 import org.apache.druid.guice.NestedDataModule;
 import org.apache.druid.jackson.DefaultObjectMapper;
 import org.apache.druid.math.expr.ExprMacroTable;
@@ -38,8 +38,9 @@ import org.apache.druid.timeline.partition.LinearShardSpec;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 
 import java.io.IOException;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
-import java.util.Set;
 import java.util.TimeZone;
 
 
@@ -90,17 +91,17 @@ public class DataSegmentCommitMessage implements WriterCommitMessage {
         this.json = json;
     }
 
-    static DataSegmentCommitMessage getInstance(List<DataSegment> addedSegments,
-                                                Set<String> segmentsToMarkUnused) throws JsonProcessingException {
-        return new DataSegmentCommitMessage(
-                MAPPER.writeValueAsString(new ProcessedSegmentData(addedSegments, segmentsToMarkUnused)));
+    static DataSegmentCommitMessage getInstance(Collection<DataSegment> segments) throws JsonProcessingException {
+        return new DataSegmentCommitMessage(MAPPER.writeValueAsString(segments));
     }
 
-    ProcessedSegmentData getSegments() throws IOException {
+
+    Collection<DataSegment> getSegments() throws IOException {
         if (json != null) {
-            return MAPPER.readValue(json, ProcessedSegmentData.class);
+            return MAPPER.readValue(json, new TypeReference<List<DataSegment>>() {
+            });
         } else {
-            return new ProcessedSegmentData();
+            return Collections.emptyList();
         }
     }
 }
