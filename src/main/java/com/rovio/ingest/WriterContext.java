@@ -80,7 +80,6 @@ public class WriterContext implements Serializable {
     private final boolean useDefaultValueForNull;
     private final boolean useThreeValueLogicForNativeFilters;
     private final int partitionNumStart;
-    private final int partitionNumEnd;
     private final String dimensionsSpec;
     private final String metricsSpec;
     private final String transformSpec;
@@ -156,16 +155,8 @@ public class WriterContext implements Serializable {
         }
 
         this.partitionNumStart = options.getInt(ConfKeys.PARTITION_NUM_START, 0);
-        this.partitionNumEnd = options.getInt(ConfKeys.PARTITION_NUM_END, Integer.MAX_VALUE);
         if (this.partitionNumStart < 0) {
             throw new IllegalArgumentException(format("\"%s\" should be >= 0", ConfKeys.PARTITION_NUM_START));
-        }
-        if (this.partitionNumEnd <= 0) {
-            throw new IllegalArgumentException(format("\"%s\" should be > 0", ConfKeys.PARTITION_NUM_END));
-        }
-        if (this.partitionNumStart >= this.partitionNumEnd) {
-            throw new IllegalArgumentException(format("\"%s\" should be less than \"%s\"",
-                    ConfKeys.PARTITION_NUM_START, ConfKeys.PARTITION_NUM_END));
         }
 
         this.isAppend = true;
@@ -222,7 +213,6 @@ public class WriterContext implements Serializable {
         this.version = context.version;
 
         this.partitionNumStart = context.partitionNumStart;
-        this.partitionNumEnd = context.partitionNumEnd;
 
         this.isAppend = false;
     }
@@ -419,10 +409,6 @@ public class WriterContext implements Serializable {
         return partitionNumStart;
     }
 
-    public int getPartitionNumEnd() {
-        return partitionNumEnd;
-    }
-
     public String getDimensionsSpec() {
         return dimensionsSpec;
     }
@@ -458,7 +444,6 @@ public class WriterContext implements Serializable {
         public static final String USE_THREE_VALUE_LOGIC_FOR_NATIVE_FILTERS = "druid.use_three_value_logic_for_native_filters";
         public static final String SEGMENT_VERSION = "druid.segment_version";
         public static final String PARTITION_NUM_START = "druid.partition_num_start";
-        public static final String PARTITION_NUM_END = "druid.partition_num_end";
         // Metadata config
         public static final String METADATA_DB_TYPE = "druid.metastore.db.type";
         public static final String METADATA_DB_URI = "druid.metastore.db.uri";

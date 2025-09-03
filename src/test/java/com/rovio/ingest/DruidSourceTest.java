@@ -40,7 +40,6 @@ import java.util.List;
 
 import static com.rovio.ingest.WriterContext.ConfKeys.DATASOURCE_INIT;
 import static com.rovio.ingest.WriterContext.ConfKeys.EXCLUDED_DIMENSIONS;
-import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_END;
 import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_START;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_GRANULARITY;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_MAX_ROWS;
@@ -99,16 +98,6 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         options.put(PARTITION_NUM_START, "-1");
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class, runJob);
         assertThat(thrown.getMessage(), containsString("\"druid.partition_num_start\" should be >= 0"));
-
-        options.put(PARTITION_NUM_START, "1000");
-        options.put(PARTITION_NUM_END, "0");
-        thrown = assertThrows(IllegalArgumentException.class, runJob);
-        assertThat(thrown.getMessage(), containsString("\"druid.partition_num_end\" should be > 0"));
-
-        options.put(PARTITION_NUM_END, "1000");
-        thrown = assertThrows(IllegalArgumentException.class, runJob);
-        assertThat(thrown.getMessage(),
-                containsString("\"druid.partition_num_start\" should be less than \"druid.partition_num_end\""));
     }
 
     @Test
@@ -222,7 +211,6 @@ public class DruidSourceTest extends DruidSourceBaseTest {
     @Test
     public void passWhenPartitionedByTimeWithAppendWriteModeAndPartitionNumStartEnd() throws IOException {
         options.put(PARTITION_NUM_START, "1000");
-        options.put(PARTITION_NUM_END, "2000");
 
         Dataset<Row> dataset = loadCsv(spark, "/data.csv");
         dataset = dataset.repartition(column("date"));
@@ -359,30 +347,6 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         String version = DateTime.now(ISOChronology.getInstanceUTC()).toString();
         verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 4, false);
         verifySegmentTable(interval, version, true, 8);
-    }
-
-    @Test
-    public void passForDayGranularityWithMaxRowsAndPartitionNumEndExceeded() throws IOException {
-        Dataset<Row> dataset = loadCsv(spark, "/data.csv");
-        List<Column> columns = Lists.newArrayList(unix_timestamp(column("date")).multiply(1000), lit("DAY"));
-        dataset = dataset.withColumn("__partition",
-                callUDF("normalizeTimeColumn",
-                        JavaConverters.asScalaIteratorConverter(columns.iterator()).asScala().toSeq()));
-
-        Dataset<Row> newDataset = dataset.repartition(column("__partition"));
-        newDataset.show(false);
-
-        options.put(EXCLUDED_DIMENSIONS, "__partition");
-        options.put(SEGMENT_MAX_ROWS, String.valueOf(1));
-        options.put(PARTITION_NUM_START, "10");
-        options.put(PARTITION_NUM_END, "18");
-        SparkException thrown = assertThrows(SparkException.class,
-                () -> newDataset.write()
-                        .format("com.rovio.ingest.DruidSource")
-                        .mode(SaveMode.Append)
-                        .options(options)
-                        .save());
-        assertThat(thrown.getCause().getMessage(), containsString("Partition nums have just reached its end = 18"));
     }
 
     @Test

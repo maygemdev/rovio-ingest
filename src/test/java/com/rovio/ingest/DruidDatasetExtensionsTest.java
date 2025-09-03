@@ -40,7 +40,6 @@ import java.util.Map;
 
 import static com.rovio.ingest.WriterContext.ConfKeys.DATASOURCE_INIT;
 import static com.rovio.ingest.WriterContext.ConfKeys.METRICS_SPEC;
-import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_END;
 import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_START;
 import static com.rovio.ingest.WriterContext.ConfKeys.QUERY_GRANULARITY;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_GRANULARITY;
@@ -573,7 +572,6 @@ public class DruidDatasetExtensionsTest extends DruidSourceBaseTest {
         DateTimeUtils.setCurrentMillisFixed(VERSION_TIME_MILLIS + 60_000);
 
         options.put(PARTITION_NUM_START, "1000");
-        options.put(PARTITION_NUM_END, "2000");
         dataset.write()
                 .format(DruidSource.FORMAT)
                 .mode(SaveMode.Append)

@@ -77,11 +77,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Supplier;
-import java.util.stream.Collectors;
 
 import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
 
@@ -284,43 +282,25 @@ class TaskDataWriter implements DataWriter<InternalRow> {
         VersionWithPartitionNum versionWithPartitionNum;
         if (context.isAppend()) {
             versionWithPartitionNum = intervalVersionMap.computeIfAbsent(interval, (k) -> {
-                List<SegmentId> segmentIds = metadataUpdater.findUsedSegments(dataSchema.getDataSource(), interval).stream()
+                return metadataUpdater.findUsedSegments(dataSchema.getDataSource(), interval).stream()
                         .map(s -> SegmentId.tryParse(dataSchema.getDataSource(), s))
                         .filter(Objects::nonNull)
-                        .collect(Collectors.toList());
-
-                Optional<SegmentId> segmentWithMaxPartitionNum = segmentIds.stream()
-                        .filter(s -> s.getPartitionNum() >= context.getPartitionNumStart()
-                                     && s.getPartitionNum() < context.getPartitionNumEnd())
-                        .max(Comparator.comparing(SegmentId::getPartitionNum));
-
-                return segmentWithMaxPartitionNum
-                        .map(s -> new VersionWithPartitionNum(s.getVersion(), s.getPartitionNum() + 1))
-                        .orElseGet(() -> {
-                            // if we have used segment not within specified offset range
-                            // we should still use its version to make sure segments will be appended
-                            String version = segmentIds.isEmpty()
-                                    ? tuningConfig.getVersioningPolicy().getVersion(interval)
-                                    : segmentIds.get(0).getVersion();
-                            return new VersionWithPartitionNum(version, context.getPartitionNumStart());
-                        });
+                        .max(Comparator.comparing(SegmentId::getPartitionNum))
+                        .map(s -> new VersionWithPartitionNum(s.getVersion(),
+                                Math.max(context.getPartitionNumStart(), s.getPartitionNum() + 1)))
+                        .orElseGet(() -> new VersionWithPartitionNum(tuningConfig
+                                .getVersioningPolicy().getVersion(interval), context.getPartitionNumStart()));
             });
         } else {
             versionWithPartitionNum = new VersionWithPartitionNum(
                     tuningConfig.getVersioningPolicy().getVersion(interval), context.getPartitionNumStart());
         }
 
-        int segmentPartitionNum = versionWithPartitionNum.maxPartitionNum + partitionNum;
-        if (segmentPartitionNum >= context.getPartitionNumEnd()) {
-            throw new IllegalStateException(String.format("Partition nums have just reached its end = %d",
-                    context.getPartitionNumEnd()));
-        }
-
         return new SegmentIdWithShardSpec(
                 dataSchema.getDataSource(),
                 interval,
                 versionWithPartitionNum.version,
-                new LinearShardSpec(segmentPartitionNum)
+                new LinearShardSpec(versionWithPartitionNum.maxPartitionNum + partitionNum)
         );
     }
 
