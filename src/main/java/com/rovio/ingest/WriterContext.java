@@ -16,12 +16,12 @@
 package com.rovio.ingest;
 
 import com.google.common.base.Preconditions;
+import org.apache.druid.java.util.common.DateTimes;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Optional;
 
 import static java.lang.String.format;
 
@@ -147,7 +147,13 @@ public class WriterContext implements Serializable {
         this.metricsSpec = options.getOrDefault(ConfKeys.METRICS_SPEC, null);
         this.transformSpec = options.getOrDefault(ConfKeys.TRANSFORM_SPEC, null);
 
-        this.version = version;
+        this.version = options.getOrDefault(ConfKeys.SEGMENT_VERSION, version);
+        try {
+            DateTimes.of(this.version);
+        } catch (IllegalArgumentException ex) {
+            throw new IllegalArgumentException(format("\"%s\" should be timestamp in ISO8601 format " +
+                                                      "(yyyy-MM-ddTHH:mm:ss.SSSZZ)", ConfKeys.SEGMENT_VERSION));
+        }
 
         this.partitionNumStart = options.getInt(ConfKeys.PARTITION_NUM_START, 0);
         this.partitionNumEnd = options.getInt(ConfKeys.PARTITION_NUM_END, Integer.MAX_VALUE);
@@ -450,6 +456,7 @@ public class WriterContext implements Serializable {
         public static final String SEGMENT_ROLLUP = "druid.segment.rollup";
         public static final String USE_DEFAULT_VALUES_FOR_NULL = "druid.use_default_values_for_null";
         public static final String USE_THREE_VALUE_LOGIC_FOR_NATIVE_FILTERS = "druid.use_three_value_logic_for_native_filters";
+        public static final String SEGMENT_VERSION = "druid.segment_version";
         public static final String PARTITION_NUM_START = "druid.partition_num_start";
         public static final String PARTITION_NUM_END = "druid.partition_num_end";
         // Metadata config

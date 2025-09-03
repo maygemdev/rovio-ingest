@@ -44,6 +44,7 @@ import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_END;
 import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_START;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_GRANULARITY;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_MAX_ROWS;
+import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_VERSION;
 import static org.apache.spark.sql.functions.callUDF;
 import static org.apache.spark.sql.functions.column;
 import static org.apache.spark.sql.functions.lit;
@@ -74,6 +75,16 @@ public class DruidSourceTest extends DruidSourceBaseTest {
                         .save());
 
         assertThat(thrown.getMessage(), containsString("Init database with Append write mode is not supported"));
+    }
+
+    @Test
+    public void failForInvalidVersionOption() {
+        Dataset<Row> dataset = loadCsv(spark, "/data.csv");
+        options.put(SEGMENT_VERSION, "invalid-version-format");
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> dataset.write().format("com.rovio.ingest.DruidSource").mode(SaveMode.Overwrite).options(options).save());
+        assertThat(thrown.getMessage(),
+                containsString("\"druid.segment_version\" should be timestamp in ISO8601 format (yyyy-MM-ddTHH:mm:ss.SSSZZ)"));
     }
 
     @Test
@@ -165,6 +176,9 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         dataset = dataset.repartition(column("date"));
         dataset.show(false);
 
+        String version = DateTime.now(ISOChronology.getInstanceUTC()).plusMinutes(10).toString();
+        options.put(SEGMENT_VERSION, version);
+
         dataset.write()
                 .format("com.rovio.ingest.DruidSource")
                 .mode(SaveMode.Append)
@@ -172,12 +186,13 @@ public class DruidSourceTest extends DruidSourceBaseTest {
                 .save();
 
         Interval interval = new Interval(DateTime.parse("2019-10-16T00:00:00Z"), DateTime.parse("2019-10-18T00:00:00Z"));
-        String version = DateTime.now(ISOChronology.getInstanceUTC()).toString();
         verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 1, false);
         List<SegmentId> segmentIds = verifySegmentTable(interval, version, true, 2);
+        Assertions.assertEquals(version, segmentIds.get(0).getVersion());
         Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(0).getIntervalStart().toString());
         Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(0).getIntervalEnd().toString());
         Assertions.assertEquals(0, segmentIds.get(0).getPartitionNum());
+        Assertions.assertEquals(version, segmentIds.get(1).getVersion());
         Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
         Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
         Assertions.assertEquals(0, segmentIds.get(1).getPartitionNum());
@@ -193,10 +208,12 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 2, false);
         segmentIds = verifySegmentTable(interval, version, true, 4);
         Assertions.assertEquals(0, segmentIds.get(0).getPartitionNum());
+        Assertions.assertEquals(version, segmentIds.get(1).getVersion());
         Assertions.assertEquals("2019-10-16T00:00:00.000Z", segmentIds.get(1).getIntervalStart().toString());
         Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(1).getIntervalEnd().toString());
         Assertions.assertEquals(1, segmentIds.get(1).getPartitionNum());
         Assertions.assertEquals(0, segmentIds.get(2).getPartitionNum());
+        Assertions.assertEquals(version, segmentIds.get(3).getVersion());
         Assertions.assertEquals("2019-10-17T00:00:00.000Z", segmentIds.get(3).getIntervalStart().toString());
         Assertions.assertEquals("2019-10-18T00:00:00.000Z", segmentIds.get(3).getIntervalEnd().toString());
         Assertions.assertEquals(1, segmentIds.get(3).getPartitionNum());
@@ -256,6 +273,9 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         dataset = dataset.repartition(column("date"));
         dataset.show(false);
 
+        String version = DateTime.now(ISOChronology.getInstanceUTC()).plusMinutes(15).toString();
+        options.put(SEGMENT_VERSION, version);
+
         dataset.write()
                 .format("com.rovio.ingest.DruidSource")
                 .mode(SaveMode.Overwrite)
@@ -263,7 +283,6 @@ public class DruidSourceTest extends DruidSourceBaseTest {
                 .save();
 
         Interval interval = new Interval(DateTime.parse("2019-10-16T00:00:00Z"), DateTime.parse("2019-10-18T00:00:00Z"));
-        String version = DateTime.now(ISOChronology.getInstanceUTC()).toString();
         verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, version, 1, false);
         verifySegmentTable(interval, version, true, 2);
     }
