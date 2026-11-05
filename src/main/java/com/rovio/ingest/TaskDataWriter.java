@@ -20,6 +20,7 @@ import com.rovio.ingest.model.Field;
 import com.rovio.ingest.model.FieldType;
 import com.rovio.ingest.model.SegmentSpec;
 import com.rovio.ingest.util.MetadataUpdater;
+import com.rovio.ingest.util.MetadataUpdater.VersionedShardSpec;
 import com.rovio.ingest.util.ReflectionUtils;
 import com.rovio.ingest.util.SegmentStorageUpdater;
 import org.apache.druid.common.config.NullHandling;
@@ -52,8 +53,11 @@ import org.apache.druid.segment.realtime.plumber.Committers;
 import org.apache.druid.segment.realtime.plumber.CustomVersioningPolicy;
 import org.apache.druid.segment.writeout.TmpFileSegmentWriteOutMediumFactory;
 import org.apache.druid.timeline.DataSegment;
-import org.apache.druid.timeline.SegmentId;
+import org.apache.druid.timeline.partition.BaseDimensionRangeShardSpec;
 import org.apache.druid.timeline.partition.LinearShardSpec;
+import org.apache.druid.timeline.partition.NumberedShardSpec;
+import org.apache.druid.timeline.partition.PartitionIds;
+import org.apache.druid.timeline.partition.ShardSpec;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.util.ArrayData;
 import org.apache.spark.sql.connector.write.DataWriter;
@@ -71,17 +75,17 @@ import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
+import static java.lang.String.format;
 
 class TaskDataWriter implements DataWriter<InternalRow> {
     private static final IndexIO INDEX_IO = new IndexIO(MAPPER, ColumnConfig.DEFAULT);
@@ -281,27 +285,117 @@ class TaskDataWriter implements DataWriter<InternalRow> {
     private SegmentIdWithShardSpec newSegmentId(Interval interval, int partitionNum) {
         VersionWithPartitionNum versionWithPartitionNum;
         if (context.isAppend()) {
-            versionWithPartitionNum = intervalVersionMap.computeIfAbsent(interval, (k) -> {
-                return metadataUpdater.findUsedSegments(dataSchema.getDataSource(), interval).stream()
-                        .map(s -> SegmentId.tryParse(dataSchema.getDataSource(), s))
-                        .filter(Objects::nonNull)
-                        .max(Comparator.comparing(SegmentId::getPartitionNum))
-                        .map(s -> new VersionWithPartitionNum(s.getVersion(),
-                                Math.max(context.getPartitionNumStart(), s.getPartitionNum() + 1)))
-                        .orElseGet(() -> new VersionWithPartitionNum(tuningConfig
-                                .getVersioningPolicy().getVersion(interval), context.getPartitionNumStart()));
-            });
+            versionWithPartitionNum = intervalVersionMap.computeIfAbsent(interval, (k) -> findAppendTarget(interval));
         } else {
             versionWithPartitionNum = new VersionWithPartitionNum(
-                    tuningConfig.getVersioningPolicy().getVersion(interval), context.getPartitionNumStart());
+                    tuningConfig.getVersioningPolicy().getVersion(interval), context.getPartitionNumStart(), null);
+        }
+
+        int shardPartitionNum = versionWithPartitionNum.maxPartitionNum() + partitionNum;
+        ShardSpec shardSpec;
+        if (versionWithPartitionNum.numCorePartitions() == null) {
+            shardSpec = new LinearShardSpec(shardPartitionNum);
+        } else {
+            if (shardPartitionNum < versionWithPartitionNum.numCorePartitions()) {
+                // The first partition num is not below the number of core partitions, but a negative partition num of
+                // the input could make it so. It would be the partition num of a core segment.
+                throw new IllegalStateException(format(
+                        "Partition num %d of a new segment in interval %s (version %s) is the partition num of a " +
+                                "segment of the core set of %d segments: partition nums of segments appended to a " +
+                                "non-linear (e.g. range) segment set must not be less than that. The partition nums of " +
+                                "the input must not be negative.",
+                        shardPartitionNum, interval, versionWithPartitionNum.version(),
+                        versionWithPartitionNum.numCorePartitions()));
+            }
+            if (shardPartitionNum >= PartitionIds.ROOT_GEN_END_PARTITION_ID) {
+                throw new IllegalStateException(format(
+                        "Partition num %d of a new segment in interval %s (version %s) is too large: partition nums of " +
+                                "segments appended to a non-linear (e.g. range) segment set must be less than %d. " +
+                                "Check \"%s\" and the partition nums of the input.",
+                        shardPartitionNum, interval, versionWithPartitionNum.version(),
+                        PartitionIds.ROOT_GEN_END_PARTITION_ID, WriterContext.ConfKeys.PARTITION_NUM_START));
+            }
+            shardSpec = new NumberedShardSpec(shardPartitionNum, versionWithPartitionNum.numCorePartitions());
         }
 
         return new SegmentIdWithShardSpec(
                 dataSchema.getDataSource(),
                 interval,
-                versionWithPartitionNum.version,
-                new LinearShardSpec(versionWithPartitionNum.maxPartitionNum + partitionNum)
+                versionWithPartitionNum.version(),
+                shardSpec
         );
+    }
+
+    /**
+     * Decides the version, the first partition num and the type of the shard spec for segments appended to an interval,
+     * based on the used segments of the max used version of the interval.
+     * <p>
+     * Druid can't serve a version that mixes linear segments with non-linear (e.g. range or numbered) ones. Thus
+     * appended segments must be of the same kind as the existing ones:
+     * <ul>
+     * <li>no existing segments: {@link LinearShardSpec}, with version from the versioning policy</li>
+     * <li>only {@link LinearShardSpec}: {@link LinearShardSpec}</li>
+     * <li>only numbered (incl. hash partitioned) or range shard specs: {@link NumberedShardSpec} with the number of core
+     * partitions of the existing segments. Segments with partition num &gt;= number of core partitions are not part of
+     * the core set, so they don't affect when the version becomes visible.</li>
+     * <li>other kinds of shard specs, or a mix: the write fails</li>
+     * </ul>
+     */
+    private VersionWithPartitionNum findAppendTarget(Interval interval) {
+        List<MetadataUpdater.VersionedShardSpec> used =
+                metadataUpdater.findUsedSegmentShardSpecs(dataSchema.getDataSource(), interval);
+        if (used.isEmpty()) {
+            return new VersionWithPartitionNum(
+                    tuningConfig.getVersioningPolicy().getVersion(interval), context.getPartitionNumStart(), null);
+        }
+
+        // All used segments are of the same version, see MetadataUpdater#findUsedSegmentShardSpecs.
+        String version = used.get(0).version();
+        int nextPartitionNum = Math.max(context.getPartitionNumStart(),
+                used.stream().mapToInt(s -> s.shardSpec().getPartitionNum()).max().getAsInt() + 1);
+
+        long linearCount = used.stream().filter(s -> s.shardSpec() instanceof LinearShardSpec).count();
+        if (linearCount == used.size()) {
+            return new VersionWithPartitionNum(version, nextPartitionNum, null);
+        }
+        if (linearCount > 0) {
+            throw new IllegalStateException(format(
+                    "Can't append to interval %s (version %s) of datasource %s: it has both linear and non-linear " +
+                            "segments, which Druid can't serve together.",
+                    interval, version, dataSchema.getDataSource()));
+        }
+
+        // Numbered segments (incl. hash partitioned) and range segments have a core set that appended segments can
+        // follow. Other kinds don't, e.g. tombstones, which have no core partitions either, and segments that overwrite
+        // other segments, which have their own partition num space.
+        Set<String> unsupportedTypes = used.stream()
+                .map(VersionedShardSpec::shardSpec)
+                .filter(s -> !(s instanceof NumberedShardSpec || s instanceof BaseDimensionRangeShardSpec))
+                .map(ShardSpec::getType)
+                .collect(Collectors.toSet());
+        if (!unsupportedTypes.isEmpty()) {
+            throw new IllegalStateException(format(
+                    "Can't append to interval %s (version %s) of datasource %s: appending to segments of shard " +
+                            "spec types %s is not supported.",
+                    interval, version, dataSchema.getDataSource(), unsupportedTypes));
+        }
+
+        // 0 is a valid number of core partitions, as in the numbered segments of streaming ingestion. The unknown
+        // number of core partitions (a negative number) of old range segments is not.
+        Set<Integer> numCorePartitions = used.stream()
+                .map(s -> s.shardSpec().getNumCorePartitions())
+                .collect(Collectors.toSet());
+        if (numCorePartitions.size() != 1 || numCorePartitions.iterator().next() < 0) {
+            throw new IllegalStateException(format(
+                    "Can't append to interval %s (version %s) of datasource %s: expected the existing segments to " +
+                            "agree on a known number of core partitions, but found %s (shard spec types: %s).",
+                    interval, version, dataSchema.getDataSource(), numCorePartitions,
+                    used.stream().map(s -> s.shardSpec().getType()).collect(Collectors.toSet())));
+        }
+        int numCore = numCorePartitions.iterator().next();
+        // Appended segments never take the partition num of a core partition, also if some core segment is not among
+        // the used segments: it would complete the core set with segments that are not the ones of the core set.
+        return new VersionWithPartitionNum(version, Math.max(nextPartitionNum, numCore), numCore);
     }
 
     private void pushSegments(List<SegmentIdWithShardSpec> toPush) throws IOException {
@@ -389,13 +483,10 @@ class TaskDataWriter implements DataWriter<InternalRow> {
         }
     }
 
-    private static final class VersionWithPartitionNum {
-        private final String version;
-        private final int maxPartitionNum;
-
-        private VersionWithPartitionNum(String version, int maxPartitionNum) {
-            this.version = version;
-            this.maxPartitionNum = maxPartitionNum;
-        }
+    /**
+     * @param numCorePartitions number of core partitions of the existing segments for {@link NumberedShardSpec},
+     *                          null for {@link LinearShardSpec}
+     */
+    private record VersionWithPartitionNum(String version, int maxPartitionNum, Integer numCorePartitions) {
     }
 }

@@ -15,13 +15,27 @@
  */
 package com.rovio.ingest;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
+import com.rovio.ingest.extensions.java.DruidDatasetExtensions;
+import com.rovio.ingest.util.MetadataUpdater;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.druid.collections.bitmap.ConciseBitmapFactory;
 import org.apache.druid.collections.bitmap.RoaringBitmapFactory;
+import org.apache.druid.data.input.StringTuple;
 import org.apache.druid.segment.QueryableIndex;
 import org.apache.druid.segment.column.StringUtf8DictionaryEncodedColumn;
 import org.apache.druid.segment.data.FrontCodedIndexed;
+import org.apache.druid.timeline.DataSegment;
 import org.apache.druid.timeline.SegmentId;
+import org.apache.druid.timeline.partition.DimensionRangeShardSpec;
+import org.apache.druid.timeline.partition.LinearShardSpec;
+import org.apache.druid.timeline.partition.NumberedOverwriteShardSpec;
+import org.apache.druid.timeline.partition.NumberedShardSpec;
+import org.apache.druid.timeline.partition.PartitionIds;
+import org.apache.druid.timeline.partition.ShardSpec;
+import org.apache.druid.timeline.partition.TombstoneShardSpec;
 import org.apache.spark.SparkException;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
@@ -30,6 +44,7 @@ import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.expressions.Window;
 import org.apache.spark.sql.functions;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeUtils;
 import org.joda.time.Interval;
@@ -41,9 +56,18 @@ import scala.collection.JavaConverters;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
+import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
 import static com.rovio.ingest.WriterContext.ConfKeys.BITMAP_FACTORY;
 import static com.rovio.ingest.WriterContext.ConfKeys.DATASOURCE_INIT;
 import static com.rovio.ingest.WriterContext.ConfKeys.EXCLUDED_DIMENSIONS;
@@ -63,6 +87,11 @@ import static org.junit.Assert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class DruidSourceTest extends DruidSourceBaseTest {
+    private static final Interval DAY_1 =
+            new Interval(DateTime.parse("2019-10-16T00:00:00Z"), DateTime.parse("2019-10-17T00:00:00Z"));
+    private static final Interval DAY_2 =
+            new Interval(DateTime.parse("2019-10-17T00:00:00Z"), DateTime.parse("2019-10-18T00:00:00Z"));
+    private static final List<String> RANGE_DIMENSIONS = Collections.singletonList("country");
 
     @Test
     public void failWithoutDatasourceOption() {
@@ -558,6 +587,279 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         interval = new Interval(DateTime.parse("2019-10-01T00:00:00Z"), DateTime.parse("2019-11-01T00:00:00Z"));
         verifySegmentTable(interval, secondVersion, true, 1);
         verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, secondVersion, 1, true);
+    }
+
+    @Test
+    public void appendCreatesNumberedTailsOnRangeCoreSet() throws IOException {
+        String version = coreVersion();
+        publishRangeCoreSet(DAY_1, version);
+        publishRangeCoreSet(DAY_2, version);
+        options.put(PARTITION_NUM_START, "1000");
+
+        append(loadCsv(spark, "/data.csv").repartition(column("date")));
+
+        for (Interval day : Arrays.asList(DAY_1, DAY_2)) {
+            Map<Integer, JsonNode> shardSpecs = findShardSpecs(day, version);
+            Assertions.assertEquals(Arrays.asList(0, 1, 2, 1000), new ArrayList<>(shardSpecs.keySet()));
+            // the core set is untouched
+            Assertions.assertEquals("range", shardSpecs.get(2).get("type").asText());
+            Assertions.assertEquals(MAPPER.readTree("{\"type\":\"numbered\",\"partitionNum\":1000,\"partitions\":3}"),
+                    shardSpecs.get(1000));
+        }
+        // one new segment per day in the same version as the core set
+        verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), new Interval(DAY_1.getStart(), DAY_2.getEnd()),
+                version, 1, false);
+        verifySegmentTable(new Interval(DAY_1.getStart(), DAY_2.getEnd()), version, true, 8);
+    }
+
+    @Test
+    public void appendContinuesAfterTheMaxPartitionNumOfNumberedTails() throws IOException {
+        String version = coreVersion();
+        publishRangeCoreSet(DAY_1, version);
+        options.put(PARTITION_NUM_START, "1000");
+
+        append(day1Dataset());
+        append(day1Dataset());
+
+        Map<Integer, JsonNode> shardSpecs = findShardSpecs(DAY_1, version);
+        Assertions.assertEquals(Arrays.asList(0, 1, 2, 1000, 1001), new ArrayList<>(shardSpecs.keySet()));
+        Assertions.assertEquals(MAPPER.readTree("{\"type\":\"numbered\",\"partitionNum\":1000,\"partitions\":3}"),
+                shardSpecs.get(1000));
+        Assertions.assertEquals(MAPPER.readTree("{\"type\":\"numbered\",\"partitionNum\":1001,\"partitions\":3}"),
+                shardSpecs.get(1001));
+    }
+
+    @Test
+    public void appendCreatesNumberedTailsOnNumberedSegments() throws IOException {
+        String version = coreVersion();
+        publishSegments(DAY_1, version, new NumberedShardSpec(0, 2), new NumberedShardSpec(1, 2));
+
+        // no druid.partition_num_start: tail starts right after the core set
+        append(day1Dataset());
+
+        Map<Integer, JsonNode> shardSpecs = findShardSpecs(DAY_1, version);
+        Assertions.assertEquals(Arrays.asList(0, 1, 2), new ArrayList<>(shardSpecs.keySet()));
+        Assertions.assertEquals(MAPPER.readTree("{\"type\":\"numbered\",\"partitionNum\":2,\"partitions\":2}"),
+                shardSpecs.get(2));
+    }
+
+    @Test
+    public void appendKeepsLinearTailsOnLinearSegments() throws IOException {
+        append(day1Dataset());
+        append(day1Dataset());
+
+        Map<Integer, JsonNode> shardSpecs = findShardSpecs(DAY_1, DateTime.now(ISOChronology.getInstanceUTC()).toString());
+        Assertions.assertEquals(Arrays.asList(0, 1), new ArrayList<>(shardSpecs.keySet()));
+        Assertions.assertEquals(MAPPER.readTree("{\"type\":\"linear\",\"partitionNum\":0}"), shardSpecs.get(0));
+        Assertions.assertEquals(MAPPER.readTree("{\"type\":\"linear\",\"partitionNum\":1}"), shardSpecs.get(1));
+    }
+
+    @Test
+    public void failToAppendToIntervalWithBothLinearAndRangeSegments() throws IOException {
+        String version = coreVersion();
+        publishRangeCoreSet(DAY_1, version);
+        publishSegments(DAY_1, version, new LinearShardSpec(3));
+
+        assertAppendFails("both linear and non-linear");
+
+        Assertions.assertEquals(4, countSegments());
+        assertNoSegmentFiles();
+    }
+
+    @Test
+    public void failToAppendWithTooLargePartitionNumToRangeCoreSet() throws IOException {
+        String version = coreVersion();
+        publishRangeCoreSet(DAY_1, version);
+        options.put(PARTITION_NUM_START, "40000");
+
+        assertAppendFails("Partition num 40000 of a new segment");
+
+        Assertions.assertEquals(3, countSegments());
+        assertNoSegmentFiles();
+    }
+
+    @Test
+    public void failToAppendWhenNumberOfCorePartitionsIsUnknown() throws IOException {
+        String version = coreVersion();
+        publishSegments(DAY_1, version, new DimensionRangeShardSpec(RANGE_DIMENSIONS, null, null, 0, null));
+
+        // DimensionRangeShardSpec.UNKNOWN_NUM_CORE_PARTITIONS
+        assertAppendFails("agree on a known number of core partitions, but found [-1]");
+
+        Assertions.assertEquals(1, countSegments());
+        assertNoSegmentFiles();
+    }
+
+    @Test
+    public void appendCreatesNumberedTailsOnNumberedSegmentsWithoutCorePartitions() throws IOException {
+        // As written by streaming ingestion: a complete set that has no core partitions
+        String version = coreVersion();
+        publishSegments(DAY_1, version, new NumberedShardSpec(0, 0), new NumberedShardSpec(1, 0));
+
+        append(day1Dataset());
+
+        Map<Integer, JsonNode> shardSpecs = findShardSpecs(DAY_1, version);
+        Assertions.assertEquals(Arrays.asList(0, 1, 2), new ArrayList<>(shardSpecs.keySet()));
+        Assertions.assertEquals(MAPPER.readTree("{\"type\":\"numbered\",\"partitionNum\":2,\"partitions\":0}"),
+                shardSpecs.get(2));
+    }
+
+    @Test
+    public void appendedSegmentsNeverTakeThePartitionNumOfACoreSegment() throws IOException {
+        // The core set has 3 segments, but the one with partition num 2 is not among the used segments, e.g. because it
+        // was killed. The next partition num after the existing ones would be 2, the one of a core segment. Then the
+        // set would look complete, with a segment that is not the one of the core set.
+        String version = coreVersion();
+        publishSegments(DAY_1, version,
+                new DimensionRangeShardSpec(RANGE_DIMENSIONS, null, StringTuple.create("FI"), 0, 3),
+                new DimensionRangeShardSpec(RANGE_DIMENSIONS, StringTuple.create("FI"), StringTuple.create("US"), 1, 3));
+
+        append(day1Dataset());
+
+        Map<Integer, JsonNode> shardSpecs = findShardSpecs(DAY_1, version);
+        Assertions.assertEquals(Arrays.asList(0, 1, 3), new ArrayList<>(shardSpecs.keySet()));
+        Assertions.assertEquals(MAPPER.readTree("{\"type\":\"numbered\",\"partitionNum\":3,\"partitions\":3}"),
+                shardSpecs.get(3));
+    }
+
+    @Test
+    public void appendedPartitionNumsOfTheInputAreAddedToTheFirstPartitionNumAfterTheCoreSet() throws IOException {
+        String version = coreVersion();
+        publishRangeCoreSet(DAY_1, version);
+
+        append(withPartitionNum(day1Dataset(), 1));
+
+        Map<Integer, JsonNode> shardSpecs = findShardSpecs(DAY_1, version);
+        // the first partition num after the core set is 3, and the one of the input is added to it
+        Assertions.assertEquals(Arrays.asList(0, 1, 2, 4), new ArrayList<>(shardSpecs.keySet()));
+        Assertions.assertEquals(MAPPER.readTree("{\"type\":\"numbered\",\"partitionNum\":4,\"partitions\":3}"),
+                shardSpecs.get(4));
+    }
+
+    @Test
+    public void failToAppendWithNegativePartitionNumThatWouldTakeTheNumOfACoreSegment() throws IOException {
+        // The first partition num after the core set of 3 segments is 3, so -1 of the input would make it 2, the
+        // partition num of a core segment: the storage path of that segment would be overwritten.
+        String version = coreVersion();
+        publishRangeCoreSet(DAY_1, version);
+        Dataset<Row> negative = withPartitionNum(day1Dataset(), -1);
+
+        SparkException thrown = assertThrows(SparkException.class, () -> append(negative));
+
+        assertThat(ExceptionUtils.getStackTrace(thrown),
+                containsString("is the partition num of a segment of the core set of 3 segments"));
+        Assertions.assertEquals(3, countSegments());
+        assertNoSegmentFiles();
+    }
+
+    /**
+     * The dataset with columns __PARTITION_TIME__ and __PARTITION_NUM__, as the Dataset extension makes them, but with
+     * the given partition num.
+     */
+    private static Dataset<Row> withPartitionNum(Dataset<Row> dataset, int partitionNum) {
+        return DruidDatasetExtensions.repartitionByDruidSegmentSize(dataset, "date", "DAY", 5_000_000, false)
+                .withColumn("__PARTITION_NUM__", lit(partitionNum))
+                .repartition(column("__PARTITION_TIME__"), column("__PARTITION_NUM__"));
+    }
+
+    @Test
+    public void failToAppendToTombstone() throws IOException {
+        // A tombstone has no core partitions, but it is not a core set that can be followed by segments
+        String version = coreVersion();
+        publishSegments(DAY_1, version, new TombstoneShardSpec());
+
+        assertAppendFails("appending to segments of shard spec types [tombstone] is not supported");
+
+        Assertions.assertEquals(1, countSegments());
+        assertNoSegmentFiles();
+    }
+
+    @Test
+    public void failToAppendToSegmentsThatOverwriteOthers() throws IOException {
+        String version = coreVersion();
+        publishSegments(DAY_1, version, new NumberedOverwriteShardSpec(PartitionIds.NON_ROOT_GEN_START_PARTITION_ID, 0, 1, (short) 1, (short) 1));
+
+        assertAppendFails("appending to segments of shard spec types [numbered_overwrite] is not supported");
+
+        Assertions.assertEquals(1, countSegments());
+        assertNoSegmentFiles();
+    }
+
+    @Test
+    public void failToAppendWhenCorePartitionsDisagree() throws Exception {
+        String version = coreVersion();
+        publishSegments(DAY_1, version,
+                new DimensionRangeShardSpec(RANGE_DIMENSIONS, null, StringTuple.create("FI"), 0, 3),
+                new DimensionRangeShardSpec(RANGE_DIMENSIONS, StringTuple.create("FI"), null, 1, 2));
+
+        assertAppendFails("agree on a known number of core partitions");
+
+        Assertions.assertEquals(2, countSegments());
+        assertNoSegmentFiles();
+    }
+
+    /**
+     * A version older than the one that a write would generate.
+     */
+    private static String coreVersion() {
+        return DateTime.now(ISOChronology.getInstanceUTC()).minusDays(1).toString();
+    }
+
+    /**
+     * Only the rows of {@link #DAY_1} of data.csv.
+     */
+    private Dataset<Row> day1Dataset() {
+        return loadCsv(spark, "/data.csv").where("date < '2019-10-17'").repartition(column("date"));
+    }
+
+    private void append(Dataset<Row> dataset) {
+        dataset.write()
+                .format("com.rovio.ingest.DruidSource")
+                .mode(SaveMode.Append)
+                .options(options)
+                .save();
+    }
+
+    private void assertAppendFails(String expectedMessage) {
+        SparkException thrown = assertThrows(SparkException.class, () -> append(day1Dataset()));
+        assertThat(ExceptionUtils.getStackTrace(thrown), containsString(expectedMessage));
+    }
+
+    private void assertNoSegmentFiles() throws IOException {
+        Path root = Paths.get(testFolder.toString(), DATA_SOURCE);
+        if (Files.exists(root)) {
+            try (Stream<Path> files = Files.walk(root)) {
+                Assertions.assertTrue(files.noneMatch(Files::isRegularFile), "Segment files left in deep storage");
+            }
+        }
+    }
+
+    /**
+     * A range partitioned core set of 3 segments, as written by Druid compaction.
+     */
+    private void publishRangeCoreSet(Interval interval, String version) {
+        publishSegments(interval, version,
+                new DimensionRangeShardSpec(RANGE_DIMENSIONS, null, StringTuple.create("FI"), 0, 3),
+                new DimensionRangeShardSpec(RANGE_DIMENSIONS, StringTuple.create("FI"), StringTuple.create("US"), 1, 3),
+                new DimensionRangeShardSpec(RANGE_DIMENSIONS, StringTuple.create("US"), null, 2, 3));
+    }
+
+    /**
+     * Publishes segments, without any data, to the metadata as if they were written earlier.
+     */
+    private void publishSegments(Interval interval, String version, ShardSpec... shardSpecs) {
+        List<DataSegment> segments = Arrays.stream(shardSpecs)
+                .map(shardSpec -> DataSegment.builder()
+                        .dataSource(DATA_SOURCE)
+                        .loadSpec(ImmutableMap.of("type", "local", "path", "tmp/unused/index.zip"))
+                        .shardSpec(shardSpec)
+                        .size(1)
+                        .binaryVersion(9)
+                        .interval(interval)
+                        .version(version)
+                        .build())
+                .collect(Collectors.toList());
+        new MetadataUpdater(WriterContext.from(new CaseInsensitiveStringMap(options), version)).publishSegments(segments);
     }
 
     @Test

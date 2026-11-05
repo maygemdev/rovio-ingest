@@ -15,6 +15,7 @@
  */
 package com.rovio.ingest;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.collect.HashBasedTable;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -49,6 +50,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.Mockito;
 import org.skife.jdbi.v2.DBI;
+import org.skife.jdbi.v2.Handle;
 import org.testcontainers.containers.JdbcDatabaseContainer;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -58,6 +60,7 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -69,6 +72,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
@@ -307,6 +311,65 @@ public class DruidSourceBaseTest extends SharedJavaSparkContext {
         }
 
         return rows;
+    }
+
+    /**
+     * Inserts a row to the segments table as is, to be able to set up segments (their payload) that wouldn't be
+     * produced by {@link com.rovio.ingest.util.MetadataUpdater#publishSegments}.
+     */
+    public static void insertSegmentRow(JdbcDatabaseContainer<?> jdbc, String id, Interval interval, String version,
+                                        boolean used, String payload) {
+        String quote = jdbc instanceof MySQLContainer ? "`" : "\"";
+        String sql = String.format("INSERT INTO %1$s (id, dataSource, created_date, start, %2$send%2$s, partitioned, "
+                + "version, used, payload, used_status_last_updated) "
+                + "VALUES (:id, :dataSource, :version, :start, :end, true, :version, :used, :payload, :version)",
+                segmentsTable, quote);
+        try (Handle handle = DBI.open(getConnectionString(jdbc), dbUser, dbPass)) {
+            handle.createStatement(sql)
+                    .bind("id", id)
+                    .bind("dataSource", DATA_SOURCE)
+                    .bind("version", version)
+                    .bind("start", interval.getStart().toString())
+                    .bind("end", interval.getEnd().toString())
+                    .bind("used", used)
+                    .bind("payload", payload.getBytes(StandardCharsets.UTF_8))
+                    .execute();
+        }
+    }
+
+    /**
+     * Reads the shard specs, as they are in the segment payloads in the segments table, of the used segments of the
+     * given interval and version.
+     *
+     * @return shard spec json by partition num
+     */
+    static Map<Integer, JsonNode> findShardSpecs(Interval interval, String version) throws IOException {
+        String sql = "SELECT payload FROM %1$s WHERE dataSource = :dataSource AND start = :start AND `end` = :end "
+                + "AND version = :version AND used = true";
+        List<Map<String, Object>> rows;
+        try (Handle handle = DBI.open(getConnectionString(MYSQL), dbUser, dbPass)) {
+            rows = handle.createQuery(String.format(sql, segmentsTable))
+                    .bind("dataSource", DATA_SOURCE)
+                    .bind("start", interval.getStart().toString())
+                    .bind("end", interval.getEnd().toString())
+                    .bind("version", version)
+                    .list();
+        }
+        Map<Integer, JsonNode> shardSpecs = new TreeMap<>();
+        for (Map<String, Object> row : rows) {
+            JsonNode shardSpec = MAPPER.readTree((byte[]) row.get("payload")).get("shardSpec");
+            shardSpecs.put(shardSpec.get("partitionNum").asInt(), shardSpec);
+        }
+        return shardSpecs;
+    }
+
+    /**
+     * @return number of all rows (used or not) in the segments table
+     */
+    static long countSegments() {
+        try (Handle handle = DBI.open(getConnectionString(MYSQL), dbUser, dbPass)) {
+            return ((Number) handle.createQuery("SELECT count(*) AS cnt FROM " + segmentsTable).first().get("cnt")).longValue();
+        }
     }
 
     /**

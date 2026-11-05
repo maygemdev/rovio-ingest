@@ -16,8 +16,12 @@
 package com.rovio.ingest.util;
 
 import com.rovio.ingest.WriterContext;
+import org.apache.druid.data.input.StringTuple;
 import org.apache.druid.timeline.DataSegment;
+import org.apache.druid.timeline.partition.DimensionRangeShardSpec;
 import org.apache.druid.timeline.partition.LinearShardSpec;
+import org.apache.druid.timeline.partition.NumberedShardSpec;
+import org.apache.druid.timeline.partition.ShardSpec;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeUtils;
@@ -38,7 +42,9 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.shaded.com.google.common.collect.ImmutableMap;
 
 import java.sql.SQLException;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
@@ -50,10 +56,12 @@ import static com.rovio.ingest.DruidSourceBaseTest.getConnectionString;
 import static com.rovio.ingest.DruidSourceBaseTest.getDataSourceOptions;
 import static com.rovio.ingest.DruidSourceBaseTest.getMySQLContainer;
 import static com.rovio.ingest.DruidSourceBaseTest.getPostgreSQLContainer;
+import static com.rovio.ingest.DruidSourceBaseTest.insertSegmentRow;
 import static com.rovio.ingest.DruidSourceBaseTest.prepareDatabase;
 import static com.rovio.ingest.DruidSourceBaseTest.segmentsTable;
 import static com.rovio.ingest.DruidSourceBaseTest.setUpDb;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @Testcontainers
 class MetadataUpdaterTest {
@@ -63,6 +71,11 @@ class MetadataUpdaterTest {
 
     @Container
     public static MySQLContainer<?> MYSQL = getMySQLContainer();
+
+    private static final Interval INTERVAL =
+            new Interval(DateTime.parse("2019-10-16T00:00:00Z"), DateTime.parse("2019-10-17T00:00:00Z"));
+    private static final Interval OTHER_INTERVAL =
+            new Interval(DateTime.parse("2019-10-17T00:00:00Z"), DateTime.parse("2019-10-18T00:00:00Z"));
 
     @BeforeAll
     public static void beforeClass() throws Exception {
@@ -84,6 +97,7 @@ class MetadataUpdaterTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"postgres", "mysql"})
+    @SuppressWarnings("removal") // findUsedSegments is deprecated, but still supported
     void publishSegments(String dbType) {
         JdbcDatabaseContainer<?> jdbc = dbType.equals("postgres") ? POSTGRES : MYSQL;
 
@@ -141,6 +155,94 @@ class MetadataUpdaterTest {
         assertEquals(2, segments.size());
         assertEquals("temp_2019-10-16T00:00:00.000Z_2019-10-18T00:00:00.000Z_2019-10-01T20:29:31.384Z", segments.get(0));
         assertEquals("temp_2019-10-16T00:00:00.000Z_2019-10-18T00:00:00.000Z_2019-10-01T20:29:31.384Z_100", segments.get(1));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"postgres", "mysql"})
+    void findUsedSegmentShardSpecs(String dbType) {
+        JdbcDatabaseContainer<?> jdbc = dbType.equals("postgres") ? POSTGRES : MYSQL;
+        MetadataUpdater updater = createUpdater(jdbc);
+
+        String oldVersion = "2019-10-01T20:29:31.384Z";
+        String newVersion = "2019-10-02T20:29:31.384Z";
+        List<String> dimensions = Arrays.asList("a", "b");
+        updater.publishSegments(Arrays.asList(
+                segment(INTERVAL, oldVersion, new LinearShardSpec(0)),
+                segment(INTERVAL, oldVersion, new LinearShardSpec(1))));
+        ShardSpec range0 = new DimensionRangeShardSpec(dimensions, null, StringTuple.create("x", null), 0, 2);
+        ShardSpec range1 = new DimensionRangeShardSpec(dimensions, StringTuple.create("x", null), null, 1, 2);
+        ShardSpec numbered = new NumberedShardSpec(1000, 2);
+        updater.publishSegments(Arrays.asList(
+                segment(INTERVAL, newVersion, numbered),
+                segment(INTERVAL, newVersion, range1),
+                segment(INTERVAL, newVersion, range0)));
+        // another interval, must not be returned
+        updater.publishSegments(Collections.singletonList(
+                segment(OTHER_INTERVAL, newVersion, new LinearShardSpec(0))));
+
+        // Only the max version of the interval is returned.
+        List<MetadataUpdater.VersionedShardSpec> result = updater.findUsedSegmentShardSpecs(DATA_SOURCE, INTERVAL);
+        result.sort(Comparator.comparingInt(s -> s.shardSpec().getPartitionNum()));
+
+        assertEquals(Arrays.asList(
+                new MetadataUpdater.VersionedShardSpec(newVersion, range0),
+                new MetadataUpdater.VersionedShardSpec(newVersion, range1),
+                new MetadataUpdater.VersionedShardSpec(newVersion, numbered)), result);
+        assertEquals(0, updater.findUsedSegmentShardSpecs(DATA_SOURCE,
+                new Interval(DateTime.parse("2019-11-01T00:00:00Z"), DateTime.parse("2019-11-02T00:00:00Z"))).size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"postgres", "mysql"})
+    void findUsedSegmentShardSpecsReadsOnlyTheShardSpec(String dbType) {
+        JdbcDatabaseContainer<?> jdbc = dbType.equals("postgres") ? POSTGRES : MYSQL;
+        MetadataUpdater updater = createUpdater(jdbc);
+
+        // A payload as written by a Druid compaction task. The rest of the payload, such as lastCompactionState,
+        // may contain anything, e.g. aggregators that are not known by rovio-ingest.
+        String payload = "{\"dataSource\":\"temp\",\"interval\":\"2019-10-16T00:00:00.000Z/2019-10-17T00:00:00.000Z\","
+                + "\"version\":\"v1\",\"loadSpec\":{\"type\":\"local\",\"path\":\"x\"},\"dimensions\":\"a,b\","
+                + "\"metrics\":\"\",\"shardSpec\":{\"type\":\"numbered\",\"partitionNum\":1,\"partitions\":2},"
+                + "\"lastCompactionState\":{\"metricsSpec\":[{\"type\":\"someAggregatorFromAnExtension\"}],"
+                + "\"someFutureField\":{\"a\":1}},\"binaryVersion\":9,\"size\":1}";
+        insertSegmentRow(jdbc, "temp_2019-10-16_v1_1", INTERVAL, "v1", true, payload);
+        // unused segments are not returned
+        insertSegmentRow(jdbc, "temp_2019-10-16_v1_2", INTERVAL, "v1", false, payload);
+
+        List<MetadataUpdater.VersionedShardSpec> result = updater.findUsedSegmentShardSpecs(DATA_SOURCE, INTERVAL);
+
+        assertEquals(Collections.singletonList(
+                new MetadataUpdater.VersionedShardSpec("v1", new NumberedShardSpec(1, 2))), result);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"postgres", "mysql"})
+    void findUsedSegmentShardSpecsFailsForPayloadWithoutShardSpec(String dbType) {
+        JdbcDatabaseContainer<?> jdbc = dbType.equals("postgres") ? POSTGRES : MYSQL;
+        MetadataUpdater updater = createUpdater(jdbc);
+
+        insertSegmentRow(jdbc, "temp_segment_without_shard_spec", INTERVAL, "v1", true, "{\"dataSource\":\"temp\"}");
+
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                () -> updater.findUsedSegmentShardSpecs(DATA_SOURCE, INTERVAL));
+        assertEquals("Segment temp_segment_without_shard_spec has no shardSpec in its payload", thrown.getMessage());
+    }
+
+    private static MetadataUpdater createUpdater(JdbcDatabaseContainer<?> jdbc) {
+        return new MetadataUpdater(WriterContext.from(new CaseInsensitiveStringMap(getDataSourceOptions(jdbc)),
+                "2019-10-01T20:29:31.384Z"));
+    }
+
+    private static DataSegment segment(Interval interval, String version, ShardSpec shardSpec) {
+        return DataSegment.builder()
+                .dataSource(DATA_SOURCE)
+                .loadSpec(ImmutableMap.of("type", "local", "path", "tmp/unused/index.zip"))
+                .shardSpec(shardSpec)
+                .size(1)
+                .binaryVersion(9)
+                .interval(interval)
+                .version(version)
+                .build();
     }
 
 }

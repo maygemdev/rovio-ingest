@@ -388,6 +388,24 @@ An example value for `druid.index_spec`, with front coded string dictionaries. P
 }
 ```
 
+#### Append mode and shard specs
+
+With `SaveMode.Append`, the shard spec of the new segments is chosen to match the segments already published for the
+same time interval (the max used version of it), because Druid can't serve a version that mixes linear segments with
+non-linear ones (e.g. range or numbered):
+
+| Existing used segments of the interval | Shard spec of the appended segments |
+| --- | --- |
+| None | `linear`, with a new version |
+| All `linear` | `linear` |
+| No `linear` (e.g. `range`, `numbered`, `hashed`, as written by Druid compaction) | `numbered` with the number of core partitions of the existing segments. Such segments are appended in the same version without changing when it becomes visible. |
+| Both `linear` and non-linear, other kinds of segments (e.g. `none`, `tombstone`, `numbered_overwrite`), or an unknown number of core partitions | Not supported, the write fails |
+
+In both cases the partition num of the new segments starts from `max("druid.partition_num_start", "max existing partition num + 1")`.
+For `numbered` segments it is also never less than the number of core partitions, so that new segments don't take the
+partition num of a core segment. For `numbered` segments the partition num must be less than 32768, otherwise the write
+fails.
+
 ## Limitations
 
 `DruidSource` is a write-only DataSource and supports only:
