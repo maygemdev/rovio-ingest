@@ -56,8 +56,6 @@ import scala.collection.JavaConverters;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -65,7 +63,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
 import static com.rovio.ingest.WriterContext.ConfKeys.BITMAP_FACTORY;
@@ -823,15 +820,6 @@ public class DruidSourceTest extends DruidSourceBaseTest {
     private void assertAppendFails(String expectedMessage) {
         SparkException thrown = assertThrows(SparkException.class, () -> append(day1Dataset()));
         assertThat(ExceptionUtils.getStackTrace(thrown), containsString(expectedMessage));
-    }
-
-    private void assertNoSegmentFiles() throws IOException {
-        Path root = Paths.get(testFolder.toString(), DATA_SOURCE);
-        if (Files.exists(root)) {
-            try (Stream<Path> files = Files.walk(root)) {
-                Assertions.assertTrue(files.noneMatch(Files::isRegularFile), "Segment files left in deep storage");
-            }
-        }
     }
 
     /**

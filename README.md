@@ -388,6 +388,80 @@ An example value for `druid.index_spec`, with front coded string dictionaries. P
 }
 ```
 
+#### Range partitioned segments
+
+By default all segments are written with `linear` shard specs, which means that Druid brokers can't skip any of the
+segments of an interval when a query has filters. Optionally, the segments of an interval can be written as a
+range partitioned core set, as Druid range partitioning (`"partitionsSpec": {"type": "range"}`) would produce. Then
+rows are clustered by the partition dimensions, and the broker can prune the segments by filters on them.
+
+| Property | Description |
+| --- | --- |
+| `druid.partition_dimensions` | Comma separated list of the dimensions to partition by, in order of significance. Must be dimensions of the segments, of type string. |
+| `druid.partition_boundaries` | The K-1 interior boundaries of the K buckets, as a json array of arrays of strings, one string for each partition dimension and `null` for a missing value. For example `[["FI","12"],["US","3"]]` for dimensions `country,client` defines three buckets: `[null, ("FI","12"))`, `[("FI","12"), ("US","3"))` and `[("US","3"), null)`. The boundaries must be strictly increasing. `[]` is a single bucket. |
+
+The two options must be given together. Requirements:
+- The write mode must be `SaveMode.Overwrite`. Segments appended later to the interval are written as
+  [`numbered` segments](#append-mode-and-shard-specs) without these options.
+- The dataset must have columns `__PARTITION_TIME__` and `__PARTITION_NUM__`, and be partitioned so that each Spark
+  task writes whole buckets, e.g. by `__PARTITION_NUM__`. `__PARTITION_NUM__` is the number of the bucket (from 0 to
+  K-1) of the row. Rows are validated: a row that doesn't belong to its bucket fails the write. If the rows of a bucket
+  end up in several Spark tasks, the write fails when committing.
+- The buckets must be ordered in the same way as Druid orders them: values are compared as strings by their UTF-16 code
+  units, and `null` is before any other value. In particular, don't use `repartitionByRange` on the dimension columns.
+- Only a single interval, i.e. a single `__PARTITION_TIME__`, can be written at a time.
+- A write that has no rows publishes nothing and is not an error, as without these options.
+- `druid.partition_num_start` must be `0`, and `druid.segment.max_rows` is ignored. There is one segment for each
+  bucket.
+- Every bucket must have rows. If a bucket has none, the write fails when committing and the pushed segments are
+  removed, because Druid would not serve an interval whose core set of segments is incomplete. Boundaries from
+  `DruidRangePartitioning` have no empty buckets, if the same rows are written as were used to compute them.
+- The number of buckets must be less than 32768.
+- With `druid.use_default_values_for_null` an empty string value of a row is the same as `null`, when the bucket of
+  the row is checked. The boundaries are used as they are, so don't use `""` in them in that mode.
+
+Note that Druid doesn't serve an interval before all of its core segments are loaded.
+
+##### Computing the buckets
+
+`DruidRangePartitioning` computes the boundaries and the buckets of the rows in Spark, in the same way as Druid does
+for a range partitioned ingestion: the boundaries are quantiles of the values of the partition dimensions, such that the
+buckets have about the same number of rows, `targetRowsPerSegment`.
+
+```java
+import com.rovio.ingest.extensions.java.DruidRangePartitioning;
+
+// aggregated: the dataset to be written, already rolled up, one row for each row of Druid
+DruidRangePartitioning partitioning = DruidRangePartitioning.compute(
+        aggregated, Arrays.asList("country", "client"), 5_000_000, true);
+
+options.put(ConfKeys.PARTITION_DIMENSIONS, "country,client");
+options.put(ConfKeys.PARTITION_BOUNDARIES, partitioning.getBoundariesJson());
+
+aggregated
+    // the interval of the rows, in the same way as for __PARTITION_TIME__ of the Dataset extension
+    .withColumn("__PARTITION_TIME__", functions.col("date"))
+    .withColumn("__PARTITION_NUM__", partitioning.bucketColumn())
+    .repartitionByRange(partitioning.getNumBuckets(), functions.col("__PARTITION_NUM__"))
+    .write()
+    .format(DruidSource.FORMAT)
+    .mode(SaveMode.Overwrite)
+    .options(options)
+    .save();
+```
+
+- The dataset is scanned once to compute the boundaries. It must give the same rows when it is written, otherwise a
+  bucket can end up without rows and the write fails, so cache it unless it is deterministic. The number of rows is the
+  number of the rows of the dataset, so it must be already rolled up. The sketches of the Spark partitions are merged in
+  several steps on the executors (`treeAggregate`), so the driver gets only a few partial sketches, about the square
+  root of the number of Spark partitions, instead of one for each partition. A sketch can be several MB.
+- The number of the buckets is the number of rows divided by `targetRowsPerSegment`, rounded, at least 1. It can be less
+  if some values are very common (a single value can't be split to several buckets), and `partitioning.getNumBuckets()`
+  tells the actual number. The boundaries are approximate: the segments don't have exactly the same number of rows.
+- The last argument is `druid.use_default_values_for_null` of the write, which defaults to `true`.
+- The partition dimensions must be columns of the dataset, of type string.
+- Use `repartitionByRange` or `repartition` only on `__PARTITION_NUM__`, not on the dimension columns, see above.
+
 #### Append mode and shard specs
 
 With `SaveMode.Append`, the shard spec of the new segments is chosen to match the segments already published for the

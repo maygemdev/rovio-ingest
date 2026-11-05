@@ -16,13 +16,17 @@
 package com.rovio.ingest;
 
 import com.google.common.base.Preconditions;
+import com.rovio.ingest.util.RangeBuckets;
 import org.apache.druid.java.util.common.DateTimes;
 import org.apache.druid.segment.IndexSpec;
+import org.apache.druid.timeline.partition.PartitionIds;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 import java.io.IOException;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
@@ -85,6 +89,9 @@ public class WriterContext implements Serializable {
     private final boolean useDefaultValueForNull;
     private final boolean useThreeValueLogicForNativeFilters;
     private final int partitionNumStart;
+    // Range partitioning. Both are null if not used. Boundaries are kept as json, because StringTuple isn't Serializable.
+    private final List<String> partitionDimensions;
+    private final String partitionBoundaries;
     private final String dimensionsSpec;
     private final String metricsSpec;
     private final String transformSpec;
@@ -170,6 +177,36 @@ public class WriterContext implements Serializable {
             throw new IllegalArgumentException(format("\"%s\" should be >= 0", ConfKeys.PARTITION_NUM_START));
         }
 
+        String partitionDimensionsOption = options.getOrDefault(ConfKeys.PARTITION_DIMENSIONS, null);
+        String partitionBoundariesOption = options.getOrDefault(ConfKeys.PARTITION_BOUNDARIES, null);
+        if ((partitionDimensionsOption == null) != (partitionBoundariesOption == null)) {
+            throw new IllegalArgumentException(format("\"%s\" and \"%s\" should be given together",
+                    ConfKeys.PARTITION_DIMENSIONS, ConfKeys.PARTITION_BOUNDARIES));
+        }
+        if (partitionDimensionsOption != null) {
+            if (this.partitionNumStart != 0) {
+                throw new IllegalArgumentException(format("\"%s\" should be 0 when \"%s\" is used",
+                        ConfKeys.PARTITION_NUM_START, ConfKeys.PARTITION_DIMENSIONS));
+            }
+            this.partitionDimensions = parsePartitionDimensions(partitionDimensionsOption);
+            this.partitionBoundaries = partitionBoundariesOption;
+            try {
+                // Fail early on the driver if the boundaries are invalid.
+                RangeBuckets buckets = RangeBuckets.of(this.partitionDimensions, this.partitionBoundaries);
+                if (buckets.getNumBuckets() >= PartitionIds.ROOT_GEN_END_PARTITION_ID) {
+                    // Partition nums of a core set must be less than this. Also checked when committing, but then all
+                    // of the segments have already been written.
+                    throw new IllegalArgumentException(format("%d buckets, but there must be less than %d",
+                            buckets.getNumBuckets(), PartitionIds.ROOT_GEN_END_PARTITION_ID));
+                }
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(format("Invalid \"%s\": %s", ConfKeys.PARTITION_BOUNDARIES, e.getMessage()), e);
+            }
+        } else {
+            this.partitionDimensions = null;
+            this.partitionBoundaries = null;
+        }
+
         // When the WriteBuilder is initially created, we don't know yet will truncate be enabled or not
         // Default behavior is to not truncate
         this.isAppend = true;
@@ -228,6 +265,8 @@ public class WriterContext implements Serializable {
         this.version = context.version;
 
         this.partitionNumStart = context.partitionNumStart;
+        this.partitionDimensions = context.partitionDimensions;
+        this.partitionBoundaries = context.partitionBoundaries;
 
         // When using this constructor version we already know that we should truncate, thus set this flag explicitly
         this.isAppend = false;
@@ -239,6 +278,23 @@ public class WriterContext implements Serializable {
 
     public static WriterContext copyForOverwrite(WriterContext context) {
         return new WriterContext(context);
+    }
+
+    private static List<String> parsePartitionDimensions(String commaSeparated) {
+        List<String> dimensions = new ArrayList<>();
+        for (String dimension : commaSeparated.split(",", -1)) {
+            String trimmed = dimension.trim();
+            if (trimmed.isEmpty()) {
+                throw new IllegalArgumentException(format("Invalid \"%s\": empty dimension name in \"%s\"",
+                        ConfKeys.PARTITION_DIMENSIONS, commaSeparated));
+            }
+            if (dimensions.contains(trimmed)) {
+                throw new IllegalArgumentException(format("Invalid \"%s\": duplicate dimension \"%s\"",
+                        ConfKeys.PARTITION_DIMENSIONS, trimmed));
+            }
+            dimensions.add(trimmed);
+        }
+        return Collections.unmodifiableList(dimensions);
     }
 
     private static String getOrThrow(CaseInsensitiveStringMap options, String key) {
@@ -456,6 +512,28 @@ public class WriterContext implements Serializable {
         return partitionNumStart;
     }
 
+    /**
+     * @return true if the segments are range partitioned, see {@link ConfKeys#PARTITION_DIMENSIONS}
+     */
+    public boolean isRangePartitioned() {
+        return partitionDimensions != null;
+    }
+
+    /**
+     * @return the dimensions of the range partitioning, null if {@link #isRangePartitioned()} is false
+     */
+    public List<String> getPartitionDimensions() {
+        return partitionDimensions;
+    }
+
+    /**
+     * @return the interior boundaries of the range partitioning as a json array, null if {@link #isRangePartitioned()}
+     * is false
+     */
+    public String getPartitionBoundaries() {
+        return partitionBoundaries;
+    }
+
     public String getDimensionsSpec() {
         return dimensionsSpec;
     }
@@ -492,6 +570,10 @@ public class WriterContext implements Serializable {
         public static final String USE_THREE_VALUE_LOGIC_FOR_NATIVE_FILTERS = "druid.use_three_value_logic_for_native_filters";
         public static final String SEGMENT_VERSION = "druid.segment_version";
         public static final String PARTITION_NUM_START = "druid.partition_num_start";
+        // Range partitioning, e.g. "country,client"
+        public static final String PARTITION_DIMENSIONS = "druid.partition_dimensions";
+        // The K-1 interior boundary tuples as a json array, e.g. [["FI","12"],["US","3"]]
+        public static final String PARTITION_BOUNDARIES = "druid.partition_boundaries";
         // Metadata config
         public static final String METADATA_DB_TYPE = "druid.metastore.db.type";
         public static final String METADATA_DB_URI = "druid.metastore.db.uri";

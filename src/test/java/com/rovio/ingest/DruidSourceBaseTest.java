@@ -74,11 +74,13 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
 import static java.nio.file.LinkOption.NOFOLLOW_LINKS;
 import static org.apache.spark.sql.functions.column;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 @Testcontainers
 public class DruidSourceBaseTest extends SharedJavaSparkContext {
@@ -311,6 +313,18 @@ public class DruidSourceBaseTest extends SharedJavaSparkContext {
         }
 
         return rows;
+    }
+
+    /**
+     * Asserts that there are no segment files in the (local) deep storage.
+     */
+    protected void assertNoSegmentFiles() throws IOException {
+        Path root = Paths.get(testFolder.toString(), DATA_SOURCE);
+        if (Files.exists(root)) {
+            try (Stream<Path> files = Files.walk(root)) {
+                assertTrue("Segment files left in deep storage", files.noneMatch(Files::isRegularFile));
+            }
+        }
     }
 
     /**

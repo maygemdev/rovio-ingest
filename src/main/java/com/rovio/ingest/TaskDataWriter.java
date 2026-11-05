@@ -21,6 +21,7 @@ import com.rovio.ingest.model.FieldType;
 import com.rovio.ingest.model.SegmentSpec;
 import com.rovio.ingest.util.MetadataUpdater;
 import com.rovio.ingest.util.MetadataUpdater.VersionedShardSpec;
+import com.rovio.ingest.util.RangeBuckets;
 import com.rovio.ingest.util.ReflectionUtils;
 import com.rovio.ingest.util.SegmentStorageUpdater;
 import org.apache.druid.common.config.NullHandling;
@@ -28,6 +29,7 @@ import org.apache.druid.common.config.NullValueHandlingConfig;
 import org.apache.druid.data.input.Committer;
 import org.apache.druid.data.input.InputRow;
 import org.apache.druid.data.input.MapBasedInputRow;
+import org.apache.druid.data.input.StringTuple;
 import org.apache.druid.java.util.common.DateTimes;
 import org.apache.druid.java.util.common.FileUtils;
 import org.apache.druid.segment.IndexIO;
@@ -54,6 +56,7 @@ import org.apache.druid.segment.realtime.plumber.CustomVersioningPolicy;
 import org.apache.druid.segment.writeout.TmpFileSegmentWriteOutMediumFactory;
 import org.apache.druid.timeline.DataSegment;
 import org.apache.druid.timeline.partition.BaseDimensionRangeShardSpec;
+import org.apache.druid.timeline.partition.DimensionRangeShardSpec;
 import org.apache.druid.timeline.partition.LinearShardSpec;
 import org.apache.druid.timeline.partition.NumberedShardSpec;
 import org.apache.druid.timeline.partition.PartitionIds;
@@ -105,6 +108,9 @@ class TaskDataWriter implements DataWriter<InternalRow> {
     private final WriterContext context;
     private final MetadataUpdater metadataUpdater;
     private final Map<Interval, VersionWithPartitionNum> intervalVersionMap;
+    // Only in range partitioned mode, see WriterContext#isRangePartitioned
+    private final RangeBuckets rangeBuckets;
+    private final Map<Interval, SegmentIdWithShardSpec[]> rangeSegmentIds;
 
     private SegmentIdWithShardSpec current;
 
@@ -129,6 +135,10 @@ class TaskDataWriter implements DataWriter<InternalRow> {
         this.committerSupplier = Committers::nil;
         this.pushedSegments = new HashSet<>();
         this.intervalVersionMap = new HashMap<>();
+        this.rangeBuckets = context.isRangePartitioned()
+                ? RangeBuckets.of(context.getPartitionDimensions(), context.getPartitionBoundaries())
+                : null;
+        this.rangeSegmentIds = new HashMap<>();
         this.appenderator.startJob();
 
         try {
@@ -155,7 +165,10 @@ class TaskDataWriter implements DataWriter<InternalRow> {
 
             if (segmentSpec.getPartitionTime() != null && segmentSpec.getPartitionNum() != null) {
                 int partitionNum = record.getInt(segmentSpec.getPartitionNum().getOrdinal());
-                current = newSegmentId(interval, partitionNum);
+                current = rangeBuckets != null
+                        // __PARTITION_NUM__ is the number of the bucket
+                        ? rangeSegmentId(interval, partitionNum, inputRow)
+                        : newSegmentId(interval, partitionNum);
             } else {
                 if (current != null && !current.getInterval().equals(interval)) {
                     // Check if any open segment has the same interval.
@@ -324,6 +337,43 @@ class TaskDataWriter implements DataWriter<InternalRow> {
                 versionWithPartitionNum.version(),
                 shardSpec
         );
+    }
+
+    /**
+     * The segment of a range partitioned core set, for the bucket of the row. There is a single segment for each
+     * interval and bucket of the task.
+     *
+     * @throws IOException if the row doesn't belong to the bucket
+     */
+    private SegmentIdWithShardSpec rangeSegmentId(Interval interval, int bucket, InputRow row) throws IOException {
+        int numBuckets = rangeBuckets.getNumBuckets();
+        if (bucket < 0 || bucket >= numBuckets) {
+            throw new IOException(format("Invalid partition num %d in interval %s: it is the number of the bucket " +
+                    "of \"%s\", which should be in [0, %d)", bucket, interval, WriterContext.ConfKeys.PARTITION_BOUNDARIES, numBuckets));
+        }
+
+        // Rows must be in the bucket that the shard spec of the segment tells, or the broker would prune the segment
+        // when it has data that matches a query.
+        StringTuple tuple = RangeBuckets.tupleOf(rangeBuckets.getDimensions(), row, context.isUseDefaultValueForNull());
+        if (!rangeBuckets.contains(bucket, tuple)) {
+            throw new IOException(format("Row doesn't belong to its bucket (partition num) in interval %s: " +
+                            "values of %s are %s, but bucket %d is [%s, %s)",
+                    interval, rangeBuckets.getDimensions(), tuple, bucket,
+                    rangeBuckets.getStart(bucket), rangeBuckets.getEnd(bucket)));
+        }
+
+        SegmentIdWithShardSpec[] segmentIds = rangeSegmentIds.computeIfAbsent(interval, k -> new SegmentIdWithShardSpec[numBuckets]);
+        if (segmentIds[bucket] == null) {
+            segmentIds[bucket] = new SegmentIdWithShardSpec(
+                    dataSchema.getDataSource(),
+                    interval,
+                    tuningConfig.getVersioningPolicy().getVersion(interval),
+                    // The number of core partitions is the number of buckets. The commit fails if some bucket got no
+                    // rows, see DruidDataSourceWriter#checkRangeCoreSet.
+                    new DimensionRangeShardSpec(rangeBuckets.getDimensions(), rangeBuckets.getStart(bucket),
+                            rangeBuckets.getEnd(bucket), bucket, numBuckets));
+        }
+        return segmentIds[bucket];
     }
 
     /**
