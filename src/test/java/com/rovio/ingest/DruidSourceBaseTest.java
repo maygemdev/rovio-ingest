@@ -29,6 +29,7 @@ import org.apache.druid.java.util.emitter.EmittingLogger;
 import org.apache.druid.java.util.emitter.service.ServiceEmitter;
 import org.apache.druid.metadata.MetadataStorageTablesConfig;
 import org.apache.druid.segment.IndexIO;
+import org.apache.druid.segment.QueryableIndex;
 import org.apache.druid.segment.QueryableIndexStorageAdapter;
 import org.apache.druid.segment.column.ColumnConfig;
 import org.apache.druid.segment.realtime.firehose.IngestSegmentFirehose;
@@ -306,6 +307,16 @@ public class DruidSourceBaseTest extends SharedJavaSparkContext {
         }
 
         return rows;
+    }
+
+    /**
+     * Loads a segment of a one day interval from the local deep storage. The caller is responsible for closing the
+     * returned index.
+     */
+    protected QueryableIndex loadSegmentIndex(Path root, DateTime day, String version, int partitionNum) throws IOException {
+        String relativePath = day + "_" + day.plusDays(1);
+        Path segmentDir = Paths.get(root.toString(), relativePath, version, String.valueOf(partitionNum), "index");
+        return new IndexIO(MAPPER, ColumnConfig.DEFAULT).loadIndex(segmentDir.toFile());
     }
 
     private ImmutableMap<ImmutableMap<String, Object>, ImmutableMap<String, Object>> readSegmentDir(Interval interval, Path segmentDir) throws IOException {

@@ -17,12 +17,15 @@ package com.rovio.ingest;
 
 import com.google.common.base.Preconditions;
 import org.apache.druid.java.util.common.DateTimes;
+import org.apache.druid.segment.IndexSpec;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.List;
 
+import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
 import static java.lang.String.format;
 
 public class WriterContext implements Serializable {
@@ -44,6 +47,8 @@ public class WriterContext implements Serializable {
     private final String segmentGranularity;
     private final String queryGranularity;
     private final String bitmapFactory;
+    private final boolean bitmapFactoryExplicit;
+    private final String indexSpec;
     private final List<String> excludedDimensions;
     private final int segmentMaxRows;
     private final int maxRowsInMemory;
@@ -91,6 +96,12 @@ public class WriterContext implements Serializable {
         this.segmentGranularity = options.getOrDefault(ConfKeys.SEGMENT_GRANULARITY, DEFAULT_SEGMENT_GRANULARITY);
         this.queryGranularity = options.getOrDefault(ConfKeys.QUERY_GRANULARITY, DEFAULT_QUERY_GRANULARITY);
         this.bitmapFactory = options.getOrDefault(ConfKeys.BITMAP_FACTORY, DEFAULT_BITMAP_FACTORY);
+        this.bitmapFactoryExplicit = options.containsKey(ConfKeys.BITMAP_FACTORY);
+        this.indexSpec = options.getOrDefault(ConfKeys.INDEX_SPEC, null);
+        if (this.indexSpec != null) {
+            // Fail early on the driver if the spec is invalid.
+            parseIndexSpec(this.indexSpec);
+        }
         this.excludedDimensions = Arrays.asList(options.getOrDefault(ConfKeys.EXCLUDED_DIMENSIONS, "").split(","));
 
         int segmentMaxRows = options.getInt(ConfKeys.SEGMENT_MAX_ROWS, DEFAULT_MAX_ROWS_PER_SEGMENT);
@@ -170,6 +181,8 @@ public class WriterContext implements Serializable {
         this.segmentGranularity = context.segmentGranularity;
         this.queryGranularity = context.queryGranularity;
         this.bitmapFactory = context.bitmapFactory;
+        this.bitmapFactoryExplicit = context.bitmapFactoryExplicit;
+        this.indexSpec = context.indexSpec;
         this.excludedDimensions = context.excludedDimensions;
         this.segmentMaxRows = context.segmentMaxRows;
         this.maxRowsInMemory = context.maxRowsInMemory;
@@ -240,6 +253,22 @@ public class WriterContext implements Serializable {
         return new IllegalArgumentException(format("Missing mandatory \"%s\" option", key));
     }
 
+    /**
+     * Parses the given JSON as {@link IndexSpec}, so that an invalid value fails on the driver instead of in a task.
+     */
+    static IndexSpec parseIndexSpec(String json) {
+        IndexSpec parsed;
+        try {
+            parsed = MAPPER.readValue(json, IndexSpec.class);
+        } catch (IOException | RuntimeException e) {
+            throw new IllegalArgumentException(format("Invalid \"%s\": %s", ConfKeys.INDEX_SPEC, e.getMessage()), e);
+        }
+        if (parsed == null) {
+            throw new IllegalArgumentException(format("Invalid \"%s\": expected a JSON object", ConfKeys.INDEX_SPEC));
+        }
+        return parsed;
+    }
+
     public String getDataSource() {
         return dataSource;
     }
@@ -258,6 +287,21 @@ public class WriterContext implements Serializable {
 
     public String getBitmapFactory() {
         return bitmapFactory;
+    }
+
+    /**
+     * @return true if {@link ConfKeys#BITMAP_FACTORY} was given in the options, false if {@link #getBitmapFactory()}
+     * is just the default.
+     */
+    public boolean isBitmapFactoryExplicit() {
+        return bitmapFactoryExplicit;
+    }
+
+    /**
+     * @return the {@link ConfKeys#INDEX_SPEC} JSON as given in the options, or null if it was not set.
+     */
+    public String getIndexSpec() {
+        return indexSpec;
     }
 
     public List<String> getExcludedDimensions() {
@@ -439,6 +483,7 @@ public class WriterContext implements Serializable {
         public static final String SEGMENT_GRANULARITY = "druid.segment_granularity";
         public static final String QUERY_GRANULARITY = "druid.query_granularity";
         public static final String BITMAP_FACTORY = "druid.bitmap_factory";
+        public static final String INDEX_SPEC = "druid.index_spec";
         public static final String EXCLUDED_DIMENSIONS = "druid.exclude_dimensions";
         public static final String SEGMENT_MAX_ROWS = "druid.segment.max_rows";
         public static final String MAX_ROWS_IN_MEMORY = "druid.memory.max_rows";

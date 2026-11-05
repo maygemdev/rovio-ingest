@@ -362,7 +362,8 @@ These are the options for `DruidSource`, to be passed with `write.options()`.
 | `druid.segment_storage.type` | Type of Deep Storage to use. Allowed values: `s3`, `local`, `hdfs`, `azure`. | `s3` |
 | `druid.segment_storage.s3.disableacl` | Whether to disable ACL in S3 config. | `false` |
 | `druid.datasource.init` | Boolean flag for (re-)initializing Druid datasource. If `true`, any pre-existing segments for the datasource is marked as unused. | `false` |
-| `druid.bitmap_factory` | Compression format for bitmap indexes. Possible values: `concise`, `roaring`. For type `roaring`, the boolean property compressRunOnSerialization is always set to `true`. `rovio-ingest` uses `concise` by default regardless of Druid library version. | `concise` |
+| `druid.bitmap_factory` | Compression format for bitmap indexes. Possible values: `concise`, `roaring`. For type `roaring`, the boolean property compressRunOnSerialization is always set to `true`. `rovio-ingest` uses `concise` by default regardless of Druid library version. If `druid.index_spec` is also set, an explicitly given `druid.bitmap_factory` takes precedence over the `bitmap` of the index spec. | `concise` |
+| `druid.index_spec` | Druid [indexSpec](https://druid.apache.org/docs/latest/ingestion/ingestion-spec/#indexspec) for the written segments, as a json object string. Allows, for example, to use front coded string dictionaries. Anything not given in the json gets Druid's default, including `bitmap`, unless `druid.bitmap_factory` is given explicitly. See [indexSpec example](#indexspec-example). | Not set: all defaults of `rovio-ingest`, including `druid.bitmap_factory` |
 | `druid.segment.rollup` | Whether to rollup data during ingestion | `true` |
 | `druid.segment.rollup` | Whether to rollup data during ingestion. Enabling this requires that there be at least one numeric input column. | `true` |
 | `druid.use_default_values_for_null` | Whether to use default values for nulls. See [SQL compatible null handling](https://druid.apache.org/docs/latest/querying/sql-data-types/#legacy-null-handling-mode) for details. | `true` |
@@ -372,6 +373,20 @@ These are the options for `DruidSource`, to be passed with `write.options()`.
 | `druid.dimensions_spec` | List of dimensions provided as json string, when not provided defaults to all non metric/non time_column fields. See [DimensionsSpec](https://druid.apache.org/docs/latest/ingestion/index.html#dimensionsspec) for details | |
 | `druid.metrics_spec` | List of aggregators to apply at ingestion time as a json array string. Possible aggregators: [metricsSpec in Druid Docs](https://druid.apache.org/docs/latest/ingestion/ingestion-spec.html#metricsspec). When not provided, defaults to using `longSum` or `doubleSum` for all numeric columns. [Datasketches](https://druid.apache.org/docs/latest/development/extensions-core/datasketches-extension.html) are supported only with this config, see [datasketches notebook](python/notebooks/druid_sketch_ingestion_test.ipynb). See also: [No-Code wrapper script](#no-code-wrapper-script). | |
 | `druid.transform_spec` | List of transformations provided as json string, when not provided defaults to no transformations. See [TransformSpec](https://druid.apache.org/docs/latest/ingestion/index.html#transformspec) for details | |
+
+#### indexSpec example
+
+An example value for `druid.index_spec`, with front coded string dictionaries. Pass it as a string in the language of your choice. It must be readable as an `IndexSpec`, which is checked before any segments are written, but as in Druid keys that are not known are ignored, so check their spelling:
+
+```json
+{
+  "bitmap": {"type": "roaring"},
+  "dimensionCompression": "lz4",
+  "stringDictionaryEncoding": {"type": "frontCoded", "bucketSize": 4, "formatVersion": 1},
+  "metricCompression": "lz4",
+  "longEncoding": "longs"
+}
+```
 
 ## Limitations
 

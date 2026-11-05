@@ -16,6 +16,11 @@
 package com.rovio.ingest;
 
 import com.google.common.collect.Lists;
+import org.apache.druid.collections.bitmap.ConciseBitmapFactory;
+import org.apache.druid.collections.bitmap.RoaringBitmapFactory;
+import org.apache.druid.segment.QueryableIndex;
+import org.apache.druid.segment.column.StringUtf8DictionaryEncodedColumn;
+import org.apache.druid.segment.data.FrontCodedIndexed;
 import org.apache.druid.timeline.SegmentId;
 import org.apache.spark.SparkException;
 import org.apache.spark.sql.Column;
@@ -35,11 +40,14 @@ import org.junit.jupiter.api.function.Executable;
 import scala.collection.JavaConverters;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.Paths;
 import java.util.List;
 
+import static com.rovio.ingest.WriterContext.ConfKeys.BITMAP_FACTORY;
 import static com.rovio.ingest.WriterContext.ConfKeys.DATASOURCE_INIT;
 import static com.rovio.ingest.WriterContext.ConfKeys.EXCLUDED_DIMENSIONS;
+import static com.rovio.ingest.WriterContext.ConfKeys.INDEX_SPEC;
 import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_START;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_GRANULARITY;
 import static com.rovio.ingest.WriterContext.ConfKeys.SEGMENT_MAX_ROWS;
@@ -49,6 +57,8 @@ import static org.apache.spark.sql.functions.column;
 import static org.apache.spark.sql.functions.lit;
 import static org.apache.spark.sql.functions.unix_timestamp;
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.instanceOf;
+import static org.hamcrest.CoreMatchers.not;
 import static org.junit.Assert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -98,6 +108,28 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         options.put(PARTITION_NUM_START, "-1");
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class, runJob);
         assertThat(thrown.getMessage(), containsString("\"druid.partition_num_start\" should be >= 0"));
+    }
+
+    @Test
+    public void failForInvalidIndexSpecOption() {
+        Dataset<Row> dataset = loadCsv(spark, "/data.csv");
+        Executable runJob = () -> dataset.write()
+                .format("com.rovio.ingest.DruidSource")
+                .mode(SaveMode.Overwrite)
+                .options(options)
+                .save();
+
+        options.put(INDEX_SPEC, "not a json");
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class, runJob);
+        assertThat(thrown.getMessage(), containsString("Invalid \"druid.index_spec\""));
+
+        options.put(INDEX_SPEC, "{\"stringDictionaryEncoding\":{\"type\":\"unknown\"}}");
+        thrown = assertThrows(IllegalArgumentException.class, runJob);
+        assertThat(thrown.getMessage(), containsString("Invalid \"druid.index_spec\""));
+
+        options.put(INDEX_SPEC, "");
+        thrown = assertThrows(IllegalArgumentException.class, runJob);
+        assertThat(thrown.getMessage(), containsString("Invalid \"druid.index_spec\""));
     }
 
     @Test
@@ -526,5 +558,89 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         interval = new Interval(DateTime.parse("2019-10-01T00:00:00Z"), DateTime.parse("2019-11-01T00:00:00Z"));
         verifySegmentTable(interval, secondVersion, true, 1);
         verifySegmentPath(Paths.get(testFolder.toString(), DATA_SOURCE), interval, secondVersion, 1, true);
+    }
+
+    @Test
+    public void passWithoutIndexSpec() throws Exception {
+        try (QueryableIndex index = writeAndLoadSegment()) {
+            // Default encodings of the library: utf8 dictionary, concise bitmaps.
+            assertThat(stringDictionary(index, "country"), not(instanceOf(FrontCodedIndexed.class)));
+            assertThat(index.getBitmapFactoryForDimensions(), instanceOf(ConciseBitmapFactory.class));
+        }
+    }
+
+    @Test
+    public void passWithFrontCodedIndexSpec() throws Exception {
+        options.put(INDEX_SPEC, "{\"bitmap\":{\"type\":\"roaring\"},\"dimensionCompression\":\"lz4\","
+                + "\"stringDictionaryEncoding\":{\"type\":\"frontCoded\",\"bucketSize\":4,\"formatVersion\":1},"
+                + "\"metricCompression\":\"lz4\",\"longEncoding\":\"longs\"}");
+
+        try (QueryableIndex index = writeAndLoadSegment()) {
+            assertThat(stringDictionary(index, "country"), instanceOf(FrontCodedIndexed.class));
+            assertThat(index.getBitmapFactoryForDimensions(), instanceOf(RoaringBitmapFactory.class));
+        }
+    }
+
+    @Test
+    public void passWithIndexSpecWithoutBitmapUsesDruidDefault() throws Exception {
+        options.put(INDEX_SPEC, "{\"stringDictionaryEncoding\":{\"type\":\"frontCoded\"}}");
+
+        try (QueryableIndex index = writeAndLoadSegment()) {
+            assertThat(stringDictionary(index, "country"), instanceOf(FrontCodedIndexed.class));
+            // druid.bitmap_factory is not set, so the default of Druid is used instead of the default of rovio-ingest.
+            assertThat(index.getBitmapFactoryForDimensions(), instanceOf(RoaringBitmapFactory.class));
+        }
+    }
+
+    @Test
+    public void passWithBitmapFactoryOverridingIndexSpec() throws Exception {
+        options.put(INDEX_SPEC, "{\"bitmap\":{\"type\":\"concise\"},"
+                + "\"stringDictionaryEncoding\":{\"type\":\"frontCoded\"}}");
+        options.put(BITMAP_FACTORY, "roaring");
+
+        try (QueryableIndex index = writeAndLoadSegment()) {
+            assertThat(stringDictionary(index, "country"), instanceOf(FrontCodedIndexed.class));
+            assertThat(index.getBitmapFactoryForDimensions(), instanceOf(RoaringBitmapFactory.class));
+        }
+    }
+
+    @Test
+    public void passWithBitmapFactoryAddedToIndexSpec() throws Exception {
+        options.put(INDEX_SPEC, "{\"stringDictionaryEncoding\":{\"type\":\"frontCoded\"}}");
+        options.put(BITMAP_FACTORY, "concise");
+
+        try (QueryableIndex index = writeAndLoadSegment()) {
+            assertThat(stringDictionary(index, "country"), instanceOf(FrontCodedIndexed.class));
+            assertThat(index.getBitmapFactoryForDimensions(), instanceOf(ConciseBitmapFactory.class));
+        }
+    }
+
+    /**
+     * Writes data.csv with the current options and loads the first segment of the first day.
+     */
+    private QueryableIndex writeAndLoadSegment() throws IOException {
+        loadCsv(spark, "/data.csv")
+                .repartition(column("date"))
+                .write()
+                .format("com.rovio.ingest.DruidSource")
+                .mode(SaveMode.Overwrite)
+                .options(options)
+                .save();
+
+        String version = DateTime.now(ISOChronology.getInstanceUTC()).toString();
+        return loadSegmentIndex(Paths.get(testFolder.toString(), DATA_SOURCE),
+                DateTime.parse("2019-10-16T00:00:00Z"), version, 0);
+    }
+
+    /**
+     * The dictionary class of a string column: {@link FrontCodedIndexed} when front coded, otherwise something else.
+     * Druid doesn't expose the dictionary encoding of a loaded column, thus reading the private field.
+     */
+    private static Object stringDictionary(QueryableIndex index, String columnName) throws Exception {
+        Object column = index.getColumnHolder(columnName).getColumn();
+        assertThat(column, instanceOf(StringUtf8DictionaryEncodedColumn.class));
+        Field dictionary = StringUtf8DictionaryEncodedColumn.class.getDeclaredField("utf8Dictionary");
+        dictionary.setAccessible(true);
+        return dictionary.get(column);
     }
 }

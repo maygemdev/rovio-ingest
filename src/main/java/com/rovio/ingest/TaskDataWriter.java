@@ -337,7 +337,7 @@ class TaskDataWriter implements DataWriter<InternalRow> {
                 null,
                 null,
                 null,
-                new IndexSpec(getBitmapSerdeFactory(context), null, null, null, null, null, null),
+                getIndexSpec(context),
                 null,
                 0,
                 0,
@@ -347,6 +347,28 @@ class TaskDataWriter implements DataWriter<InternalRow> {
                 null,
                 null
         );
+    }
+
+    private IndexSpec getIndexSpec(WriterContext context) {
+        if (context.getIndexSpec() == null) {
+            return new IndexSpec(getBitmapSerdeFactory(context), null, null, null, null, null, null);
+        }
+
+        IndexSpec indexSpec = WriterContext.parseIndexSpec(context.getIndexSpec());
+        if (!context.isBitmapFactoryExplicit()) {
+            // Anything not given in druid.index_spec (incl. the bitmap) is left to Druid's defaults.
+            return indexSpec;
+        }
+        // An explicitly given druid.bitmap_factory takes precedence over the bitmap of druid.index_spec.
+        return IndexSpec.builder()
+                .withBitmapSerdeFactory(getBitmapSerdeFactory(context))
+                .withDimensionCompression(indexSpec.getDimensionCompression())
+                .withStringDictionaryEncoding(indexSpec.getStringDictionaryEncoding())
+                .withMetricCompression(indexSpec.getMetricCompression())
+                .withLongEncoding(indexSpec.getLongEncoding())
+                .withJsonCompression(indexSpec.getJsonCompression())
+                .withSegmentLoader(indexSpec.getSegmentLoader())
+                .build();
     }
 
     private BitmapSerdeFactory getBitmapSerdeFactory(WriterContext context) {
