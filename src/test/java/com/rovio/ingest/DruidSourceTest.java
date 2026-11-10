@@ -30,7 +30,6 @@ import org.apache.druid.segment.column.StringEncodingStrategy;
 import org.apache.druid.segment.column.StringUtf8DictionaryEncodedColumn;
 import org.apache.druid.segment.data.CompressionFactory;
 import org.apache.druid.segment.data.CompressionStrategy;
-import org.apache.druid.segment.data.ConciseBitmapSerdeFactory;
 import org.apache.druid.segment.data.FrontCodedIndexed;
 import org.apache.druid.segment.data.RoaringBitmapSerdeFactory;
 import org.apache.druid.timeline.DataSegment;
@@ -963,14 +962,15 @@ public class DruidSourceTest extends DruidSourceBaseTest {
 
     @Test
     public void indexSpecOfTheWriterIsTheGivenOneWithoutBitmapFactory() {
-        options.put(INDEX_SPEC, "{\"bitmap\":{\"type\":\"concise\"},\"dimensionCompression\":\"uncompressed\","
+        // roaring, as concise is the default of druid.bitmap_factory: the test must not pass if the default was used
+        options.put(INDEX_SPEC, "{\"bitmap\":{\"type\":\"roaring\"},\"dimensionCompression\":\"uncompressed\","
                 + "\"metricCompression\":\"zstd\"}");
 
         IndexSpec indexSpec = TaskDataWriter.getIndexSpec(
                 WriterContext.from(new CaseInsensitiveStringMap(options), DateTime.now(ISOChronology.getInstanceUTC()).toString()));
 
         // druid.bitmap_factory is not given, so the bitmap of the spec stays
-        assertThat(indexSpec.getBitmapSerdeFactory(), instanceOf(ConciseBitmapSerdeFactory.class));
+        assertThat(indexSpec.getBitmapSerdeFactory(), instanceOf(RoaringBitmapSerdeFactory.class));
         Assertions.assertEquals(CompressionStrategy.UNCOMPRESSED, indexSpec.getDimensionCompression());
         Assertions.assertEquals(CompressionStrategy.ZSTD, indexSpec.getMetricCompression());
     }
