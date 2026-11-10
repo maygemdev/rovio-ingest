@@ -17,6 +17,7 @@ package com.rovio.ingest;
 
 import com.google.common.base.Preconditions;
 import com.rovio.ingest.util.RangeBuckets;
+import org.apache.druid.data.input.StringTuple;
 import org.apache.druid.java.util.common.DateTimes;
 import org.apache.druid.segment.IndexSpec;
 import org.apache.druid.timeline.partition.PartitionIds;
@@ -194,10 +195,22 @@ public class WriterContext implements Serializable {
                 // Fail early on the driver if the boundaries are invalid.
                 RangeBuckets buckets = RangeBuckets.of(this.partitionDimensions, this.partitionBoundaries);
                 if (buckets.getNumBuckets() >= PartitionIds.ROOT_GEN_END_PARTITION_ID) {
-                    // Partition nums of a core set must be less than this. Also checked when committing, but then all
-                    // of the segments have already been written.
+                    // Partition nums of a core set must be less than this. Checked here, before any segment is written.
                     throw new IllegalArgumentException(format("%d buckets, but there must be less than %d",
                             buckets.getNumBuckets(), PartitionIds.ROOT_GEN_END_PARTITION_ID));
+                }
+                if (this.useDefaultValueForNull) {
+                    // The empty string of a row is null then, so a boundary with "" would not split the rows as it says.
+                    for (int i = 0; i < buckets.getNumBuckets() - 1; i++) {
+                        StringTuple boundary = buckets.getEnd(i);
+                        for (int j = 0; j < boundary.size(); j++) {
+                            if ("".equals(boundary.get(j))) {
+                                throw new IllegalArgumentException(format("boundary %d (%s) has an empty string, which " +
+                                        "is the same as null when \"%s\" is true: use null instead",
+                                        i, boundary, ConfKeys.USE_DEFAULT_VALUES_FOR_NULL));
+                            }
+                        }
+                    }
                 }
             } catch (IllegalArgumentException e) {
                 throw new IllegalArgumentException(format("Invalid \"%s\": %s", ConfKeys.PARTITION_BOUNDARIES, e.getMessage()), e);

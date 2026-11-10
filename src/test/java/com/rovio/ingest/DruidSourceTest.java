@@ -905,6 +905,20 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         }
     }
 
+    @Test
+    public void passWithBitmapFactoryAndAllTheOtherFieldsOfIndexSpec() throws Exception {
+        // The bitmap is replaced in the json of the spec, the other fields are parsed as they are.
+        options.put(INDEX_SPEC, "{\"bitmap\":{\"type\":\"concise\"},\"dimensionCompression\":\"uncompressed\","
+                + "\"stringDictionaryEncoding\":{\"type\":\"frontCoded\",\"bucketSize\":8,\"formatVersion\":1},"
+                + "\"metricCompression\":\"uncompressed\",\"longEncoding\":\"longs\",\"jsonCompression\":\"lz4\"}");
+        options.put(BITMAP_FACTORY, "roaring");
+
+        try (QueryableIndex index = writeAndLoadSegment()) {
+            assertThat(stringDictionary(index, "country"), instanceOf(FrontCodedIndexed.class));
+            assertThat(index.getBitmapFactoryForDimensions(), instanceOf(RoaringBitmapFactory.class));
+        }
+    }
+
     /**
      * Writes data.csv with the current options and loads the first segment of the first day.
      */

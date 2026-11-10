@@ -418,7 +418,8 @@ The two options must be given together. Requirements:
   `DruidRangePartitioning` have no empty buckets, if the same rows are written as were used to compute them.
 - The number of buckets must be less than 32768.
 - With `druid.use_default_values_for_null` an empty string value of a row is the same as `null`, when the bucket of
-  the row is checked. The boundaries are used as they are, so don't use `""` in them in that mode.
+  the row is checked. So a boundary can't have `""` in that mode, use `null` instead: such a boundary is rejected
+  before anything is written.
 
 Note that Druid doesn't serve an interval before all of its core segments are loaded.
 
@@ -461,6 +462,10 @@ aggregated
 - The last argument is `druid.use_default_values_for_null` of the write, which defaults to `true`.
 - The partition dimensions must be columns of the dataset, of type string.
 - Use `repartitionByRange` or `repartition` only on `__PARTITION_NUM__`, not on the dimension columns, see above.
+- `repartitionByRange(K, col("__PARTITION_NUM__"))` is correct, as each bucket ends up in one task, but it doesn't
+  give exactly one bucket for each task: with 5 buckets one task got two buckets and another got none. That only
+  affects how evenly the write is spread over the tasks. Since Spark 4.1.0 there is
+  `Dataset.repartitionById(K, col("__PARTITION_NUM__"))`, which puts the bucket `i` to the partition `i`.
 
 #### Append mode and shard specs
 
@@ -479,6 +484,19 @@ In both cases the partition num of the new segments starts from `max("druid.part
 For `numbered` segments it is also never less than the number of core partitions, so that new segments don't take the
 partition num of a core segment. For `numbered` segments the partition num must be less than 32768, otherwise the write
 fails.
+
+Limitations:
+- The segments of the interval are looked up by exactly the interval of the new segments. If Druid compacted the data
+  into segments of a coarser granularity (e.g. hourly segments into one segment of the day), appending to one of the
+  hours doesn't see the compacted segment: the new segments are either added to the old hourly version, or, if the
+  hourly segments are not used any more, written as `linear` segments with a new version. In both cases the compacted
+  segment overshadows them and their rows are never queried. Append to the interval of the segments that Druid serves.
+- Prepare the dataset with the [Dataset extension](#dataset-extension), so that it has `__PARTITION_TIME__` and
+  `__PARTITION_NUM__`. Without them a write that has more rows than `druid.segment.max_rows`, or that has several
+  Spark tasks, is not supported. A known limitation of that case is that when the write is split into several
+  segments, the partition num of the next one is derived from the full partition num of the previous one, which
+  already includes `druid.partition_num_start` (or the first partition num of an append). With a non-zero start the
+  partition nums grow faster than by one, and for `numbered` segments they can reach the limit of 32768.
 
 ## Limitations
 

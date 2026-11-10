@@ -25,7 +25,6 @@ import org.apache.druid.segment.column.ColumnType;
 import org.apache.druid.segment.loading.DataSegmentKiller;
 import org.apache.druid.timeline.DataSegment;
 import org.apache.druid.timeline.partition.DimensionRangeShardSpec;
-import org.apache.druid.timeline.partition.PartitionIds;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.write.BatchWrite;
 import org.apache.spark.sql.connector.write.DataWriter;
@@ -177,12 +176,8 @@ class DruidDataSourceWriter implements BatchWrite {
         }
         Interval interval = intervals.iterator().next();
 
+        // The number of buckets is limited to less than 32768 on the driver, see WriterContext.
         int numCorePartitions = ((DimensionRangeShardSpec) segments.get(0).getShardSpec()).getNumCorePartitions();
-        if (numCorePartitions >= PartitionIds.ROOT_GEN_END_PARTITION_ID) {
-            throw new IllegalStateException(String.format("Too many buckets (%d) in interval %s: partition nums of " +
-                            "a range partitioned core set must be less than %d. Use fewer buckets.",
-                    numCorePartitions, interval, PartitionIds.ROOT_GEN_END_PARTITION_ID));
-        }
 
         Set<Integer> buckets = new HashSet<>();
         for (DataSegment segment : segments) {

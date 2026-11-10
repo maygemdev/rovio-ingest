@@ -16,6 +16,8 @@
 package com.rovio.ingest;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.rovio.ingest.model.Field;
 import com.rovio.ingest.model.FieldType;
 import com.rovio.ingest.model.SegmentSpec;
@@ -503,16 +505,20 @@ class TaskDataWriter implements DataWriter<InternalRow> {
             // Anything not given in druid.index_spec (incl. the bitmap) is left to Druid's defaults.
             return indexSpec;
         }
-        // An explicitly given druid.bitmap_factory takes precedence over the bitmap of druid.index_spec.
-        return IndexSpec.builder()
-                .withBitmapSerdeFactory(getBitmapSerdeFactory(context))
-                .withDimensionCompression(indexSpec.getDimensionCompression())
-                .withStringDictionaryEncoding(indexSpec.getStringDictionaryEncoding())
-                .withMetricCompression(indexSpec.getMetricCompression())
-                .withLongEncoding(indexSpec.getLongEncoding())
-                .withJsonCompression(indexSpec.getJsonCompression())
-                .withSegmentLoader(indexSpec.getSegmentLoader())
-                .build();
+        // An explicitly given druid.bitmap_factory takes precedence over the bitmap of druid.index_spec. The bitmap is
+        // replaced in the JSON, which is then parsed once more, so that no other field of the spec is dropped, also not
+        // one that a later version of Druid adds.
+        try {
+            JsonNode tree = MAPPER.readTree(context.getIndexSpec());
+            if (!(tree instanceof ObjectNode)) {
+                throw new IllegalStateException(format("\"%s\" is not a JSON object", WriterContext.ConfKeys.INDEX_SPEC));
+            }
+            ((ObjectNode) tree).set("bitmap", MAPPER.valueToTree(getBitmapSerdeFactory(context)));
+            return MAPPER.treeToValue(tree, IndexSpec.class);
+        } catch (IOException e) {
+            throw new IllegalStateException(format("Failed to apply \"%s\" to \"%s\": %s",
+                    WriterContext.ConfKeys.BITMAP_FACTORY, WriterContext.ConfKeys.INDEX_SPEC, e.getMessage()), e);
+        }
     }
 
     private BitmapSerdeFactory getBitmapSerdeFactory(WriterContext context) {

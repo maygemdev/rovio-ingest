@@ -16,7 +16,10 @@
 package com.rovio.ingest;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.rovio.ingest.util.ReflectionUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.apache.druid.common.config.NullHandling;
+import org.apache.druid.common.config.NullValueHandlingConfig;
 import org.apache.druid.segment.QueryableIndex;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
@@ -54,6 +57,7 @@ import static com.rovio.ingest.WriterContext.ConfKeys.METRICS_SPEC;
 import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_BOUNDARIES;
 import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_DIMENSIONS;
 import static com.rovio.ingest.WriterContext.ConfKeys.PARTITION_NUM_START;
+import static com.rovio.ingest.WriterContext.ConfKeys.USE_DEFAULT_VALUES_FOR_NULL;
 import static org.apache.spark.sql.functions.column;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.junit.Assert.assertThat;
@@ -170,26 +174,41 @@ public class DruidSourceRangePartitioningTest extends DruidSourceBaseTest {
     }
 
     @Test
-    public void emptyStringIsNullWhenDefaultValuesAreUsedForNull() throws IOException {
-        // In the default null handling mode an empty string is null: (FI,"") is the tuple (FI,null), which is before
-        // the boundary (FI,""). (The boundary has "" only to show this, boundaries are used as they are.)
+    public void emptyStringBoundaryIsAcceptedWhenNullIsNotTheDefaultValue() throws IOException {
+        // Without default values for null the empty string is a value of its own, after null:
+        // (FI,null) < (FI,"") < (FI,"a"). So the boundary (FI,"") can split them.
+        options.put(USE_DEFAULT_VALUES_FOR_NULL, "false");
         options.put(PARTITION_BOUNDARIES, "[[\"FI\",\"\"]]");
-        List<Row> rows = Arrays.asList(
-                row("2019-10-16", "FI", "", 1, 0),
-                row("2019-10-16", "FI", "a", 2, 1));
+        try {
+            List<Row> rows = Arrays.asList(
+                    row("2019-10-16", "FI", null, 0, 0),
+                    row("2019-10-16", "FI", "", 1, 1),
+                    row("2019-10-16", "FI", "a", 2, 1));
 
-        write(partitioned(spark.createDataFrame(rows, SCHEMA)));
+            write(partitioned(spark.createDataFrame(rows, SCHEMA)));
 
-        Map<Integer, JsonNode> shardSpecs = findShardSpecs(DAY, version());
-        assertEquals(2, shardSpecs.size());
-        assertEquals(rangeSpec("[\"country\",\"client\"]", "null", "[\"FI\",\"\"]", 0, 2), shardSpecs.get(0));
-        assertEquals(rangeSpec("[\"country\",\"client\"]", "[\"FI\",\"\"]", "null", 1, 2), shardSpecs.get(1));
+            Map<Integer, JsonNode> shardSpecs = findShardSpecs(DAY, version());
+            assertEquals(2, shardSpecs.size());
+            assertEquals(rangeSpec("[\"country\",\"client\"]", "null", "[\"FI\",\"\"]", 0, 2), shardSpecs.get(0));
+            assertEquals(rangeSpec("[\"country\",\"client\"]", "[\"FI\",\"\"]", "null", 1, 2), shardSpecs.get(1));
 
-        // (FI,"") is not in the second bucket, which starts at (FI,"")
-        List<Row> inSecondBucket = Arrays.asList(
-                row("2019-10-16", "FI", "", 1, 1),
-                row("2019-10-16", "FI", "a", 2, 1));
-        assertWriteFails(partitioned(spark.createDataFrame(inSecondBucket, SCHEMA)), "Row doesn't belong to its bucket");
+            // (FI,"") is not in the first bucket, which ends at (FI,"")
+            List<Row> inFirstBucket = Arrays.asList(
+                    row("2019-10-16", "FI", null, 0, 0),
+                    row("2019-10-16", "FI", "", 1, 0));
+            assertWriteFails(partitioned(spark.createDataFrame(inFirstBucket, SCHEMA)), "Row doesn't belong to its bucket");
+        } finally {
+            // the writer sets the null handling of the JVM from its options
+            resetNullHandling();
+        }
+    }
+
+    private static void resetNullHandling() throws IOException {
+        try {
+            ReflectionUtils.setStaticFieldValue(NullHandling.class, "INSTANCE", new NullValueHandlingConfig(true, true, null));
+        } catch (NoSuchFieldException | IllegalAccessException e) {
+            throw new IOException(e);
+        }
     }
 
     @Test
@@ -287,6 +306,11 @@ public class DruidSourceRangePartitioningTest extends DruidSourceBaseTest {
                 invalid("Invalid \"druid.partition_boundaries\"", o -> o.put(PARTITION_BOUNDARIES, "not json")),
                 invalid("should have 2 values", o -> o.put(PARTITION_BOUNDARIES, "[[\"FI\"]]")),
                 invalid("is neither a string nor null", o -> o.put(PARTITION_BOUNDARIES, "[[\"FI\",4]]")),
+                // the empty string of a row is null with default values for null, so such a boundary can't split rows
+                invalid("boundary 0 ([FI, ]) has an empty string, which is the same as null when " +
+                        "\"druid.use_default_values_for_null\" is true: use null instead",
+                        o -> o.put(PARTITION_BOUNDARIES, "[[\"FI\",\"\"]]")),
+                invalid("boundary 1 ([AT, ]) has an empty string", o -> o.put(PARTITION_BOUNDARIES, "[[\"AT\",null],[\"AT\",\"\"]]")),
                 invalid("strictly increasing", o -> o.put(PARTITION_BOUNDARIES, "[[\"US\",\"3\"],[\"FI\",\"12\"]]")),
                 invalid("strictly increasing", o -> o.put(PARTITION_BOUNDARIES, "[[\"FI\",\"12\"],[\"FI\",\"12\"]]")),
                 invalid("\"druid.partition_num_start\" should be 0", o -> o.put(PARTITION_NUM_START, "1000")),
