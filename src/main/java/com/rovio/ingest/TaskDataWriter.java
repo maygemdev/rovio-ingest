@@ -311,16 +311,16 @@ class TaskDataWriter implements DataWriter<InternalRow> {
         if (versionWithPartitionNum.numCorePartitions() == null) {
             shardSpec = new LinearShardSpec(shardPartitionNum);
         } else {
-            if (shardPartitionNum < versionWithPartitionNum.numCorePartitions()) {
-                // The first partition num is not below the number of core partitions, but a negative partition num of
-                // the input could make it so. It would be the partition num of a core segment.
+            if (partitionNum < 0) {
+                // The first partition num is after the existing segments and not below the number of core partitions.
+                // A negative partition num of the input would take the partition num of an existing segment, a core
+                // segment or an earlier tail, and overwrite the files of that segment in the deep storage.
                 throw new IllegalStateException(format(
-                        "Partition num %d of a new segment in interval %s (version %s) is the partition num of a " +
-                                "segment of the core set of %d segments: partition nums of segments appended to a " +
-                                "non-linear (e.g. range) segment set must not be less than that. The partition nums of " +
-                                "the input must not be negative.",
-                        shardPartitionNum, interval, versionWithPartitionNum.version(),
-                        versionWithPartitionNum.numCorePartitions()));
+                        "Partition num %d of the input for interval %s (version %s) is negative: partition nums of " +
+                                "segments appended to a non-linear (e.g. range) segment set are added to the first " +
+                                "partition num after the existing segments (%d), so they must not be negative.",
+                        partitionNum, interval, versionWithPartitionNum.version(),
+                        versionWithPartitionNum.maxPartitionNum()));
             }
             if (shardPartitionNum >= PartitionIds.ROOT_GEN_END_PARTITION_ID) {
                 throw new IllegalStateException(format(
@@ -495,7 +495,8 @@ class TaskDataWriter implements DataWriter<InternalRow> {
         );
     }
 
-    private IndexSpec getIndexSpec(WriterContext context) {
+    // Not private to be tested
+    static IndexSpec getIndexSpec(WriterContext context) {
         if (context.getIndexSpec() == null) {
             return new IndexSpec(getBitmapSerdeFactory(context), null, null, null, null, null, null);
         }
@@ -521,7 +522,7 @@ class TaskDataWriter implements DataWriter<InternalRow> {
         }
     }
 
-    private BitmapSerdeFactory getBitmapSerdeFactory(WriterContext context) {
+    private static BitmapSerdeFactory getBitmapSerdeFactory(WriterContext context) {
         switch (context.getBitmapFactory()) {
             case "concise":
                 return new ConciseBitmapSerdeFactory();

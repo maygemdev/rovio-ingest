@@ -482,15 +482,22 @@ non-linear ones (e.g. range or numbered):
 
 In both cases the partition num of the new segments starts from `max("druid.partition_num_start", "max existing partition num + 1")`.
 For `numbered` segments it is also never less than the number of core partitions, so that new segments don't take the
-partition num of a core segment. For `numbered` segments the partition num must be less than 32768, otherwise the write
-fails.
+partition num of a core segment. For `numbered` segments the partition num must be less than 32768, and the partition
+nums of the dataset (`__PARTITION_NUM__`) must not be negative, otherwise the write fails.
 
 Limitations:
 - The segments of the interval are looked up by exactly the interval of the new segments. If Druid compacted the data
   into segments of a coarser granularity (e.g. hourly segments into one segment of the day), appending to one of the
-  hours doesn't see the compacted segment: the new segments are either added to the old hourly version, or, if the
-  hourly segments are not used any more, written as `linear` segments with a new version. In both cases the compacted
-  segment overshadows them and their rows are never queried. Append to the interval of the segments that Druid serves.
+  hours doesn't see the compacted segment, and the write succeeds, but its rows are not what you want:
+  - If the hourly segments are still used, the new segments are added to the old hourly version, which the compacted
+    segment overshadows. Their rows are never queried.
+  - If the hourly segments are not used any more, the new segments are `linear` and have the version of the write.
+    Without `druid.segment_version` that is the time of the write, which is higher than the version of the compacted
+    segment: the new segments overshadow that hour of the compacted segment, so queries for the hour return only the
+    appended rows, and the rows that were there disappear. With an explicit `druid.segment_version` that is lower than
+    the version of the compacted segment, the new segments are overshadowed instead, and their rows are never queried.
+
+  Append to the interval of the segments that Druid serves.
 - Prepare the dataset with the [Dataset extension](#dataset-extension), so that it has `__PARTITION_TIME__` and
   `__PARTITION_NUM__`. Without them a write that has more rows than `druid.segment.max_rows`, or that has several
   Spark tasks, is not supported. A known limitation of that case is that when the write is split into several

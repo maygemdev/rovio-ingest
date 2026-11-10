@@ -24,9 +24,15 @@ import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.druid.collections.bitmap.ConciseBitmapFactory;
 import org.apache.druid.collections.bitmap.RoaringBitmapFactory;
 import org.apache.druid.data.input.StringTuple;
+import org.apache.druid.segment.IndexSpec;
 import org.apache.druid.segment.QueryableIndex;
+import org.apache.druid.segment.column.StringEncodingStrategy;
 import org.apache.druid.segment.column.StringUtf8DictionaryEncodedColumn;
+import org.apache.druid.segment.data.CompressionFactory;
+import org.apache.druid.segment.data.CompressionStrategy;
+import org.apache.druid.segment.data.ConciseBitmapSerdeFactory;
 import org.apache.druid.segment.data.FrontCodedIndexed;
+import org.apache.druid.segment.data.RoaringBitmapSerdeFactory;
 import org.apache.druid.timeline.DataSegment;
 import org.apache.druid.timeline.SegmentId;
 import org.apache.druid.timeline.partition.DimensionRangeShardSpec;
@@ -739,13 +745,41 @@ public class DruidSourceTest extends DruidSourceBaseTest {
         // partition num of a core segment: the storage path of that segment would be overwritten.
         String version = coreVersion();
         publishRangeCoreSet(DAY_1, version);
+
+        assertAppendFailsWithNegativePartitionNum(version, 3, 3);
+    }
+
+    @Test
+    public void failToAppendWithNegativePartitionNumThatWouldTakeTheNumOfAnExistingTail() throws IOException {
+        // Core set 0..2 and a tail 3: the first partition num is 4, so -1 of the input would make it 3, the partition
+        // num of the tail. That is not in the core set, so only a check of the negative number itself catches it.
+        String version = coreVersion();
+        publishRangeCoreSet(DAY_1, version);
+        publishSegments(DAY_1, version, new NumberedShardSpec(3, 3));
+
+        assertAppendFailsWithNegativePartitionNum(version, 4, 4);
+    }
+
+    @Test
+    public void failToAppendWithNegativePartitionNumToNumberedSegmentsWithoutCorePartitions() throws IOException {
+        // No core partitions: the first partition num is 2, so -1 of the input would make it 1, a partition num of the
+        // existing segments.
+        String version = coreVersion();
+        publishSegments(DAY_1, version, new NumberedShardSpec(0, 0), new NumberedShardSpec(1, 0));
+
+        assertAppendFailsWithNegativePartitionNum(version, 2, 2);
+    }
+
+    private void assertAppendFailsWithNegativePartitionNum(String version, int firstPartitionNum, int expectedNumSegments) throws IOException {
         Dataset<Row> negative = withPartitionNum(day1Dataset(), -1);
 
         SparkException thrown = assertThrows(SparkException.class, () -> append(negative));
 
+        assertThat(ExceptionUtils.getStackTrace(thrown), containsString("Partition num -1 of the input"));
         assertThat(ExceptionUtils.getStackTrace(thrown),
-                containsString("is the partition num of a segment of the core set of 3 segments"));
-        Assertions.assertEquals(3, countSegments());
+                containsString("the first partition num after the existing segments (" + firstPartitionNum + ")"));
+        Assertions.assertEquals(expectedNumSegments, findShardSpecs(DAY_1, version).size());
+        Assertions.assertEquals(expectedNumSegments, countSegments());
         assertNoSegmentFiles();
     }
 
@@ -906,17 +940,39 @@ public class DruidSourceTest extends DruidSourceBaseTest {
     }
 
     @Test
-    public void passWithBitmapFactoryAndAllTheOtherFieldsOfIndexSpec() throws Exception {
-        // The bitmap is replaced in the json of the spec, the other fields are parsed as they are.
+    public void indexSpecOfTheWriterKeepsAllTheOtherFieldsWhenBitmapFactoryIsExplicit() {
+        // The bitmap is replaced in the json of the spec and the other fields are parsed as they are. All of them have
+        // other values than the defaults, so that a field that is dropped shows.
         options.put(INDEX_SPEC, "{\"bitmap\":{\"type\":\"concise\"},\"dimensionCompression\":\"uncompressed\","
                 + "\"stringDictionaryEncoding\":{\"type\":\"frontCoded\",\"bucketSize\":8,\"formatVersion\":1},"
-                + "\"metricCompression\":\"uncompressed\",\"longEncoding\":\"longs\",\"jsonCompression\":\"lz4\"}");
+                + "\"metricCompression\":\"zstd\",\"longEncoding\":\"auto\",\"jsonCompression\":\"zstd\"}");
         options.put(BITMAP_FACTORY, "roaring");
 
-        try (QueryableIndex index = writeAndLoadSegment()) {
-            assertThat(stringDictionary(index, "country"), instanceOf(FrontCodedIndexed.class));
-            assertThat(index.getBitmapFactoryForDimensions(), instanceOf(RoaringBitmapFactory.class));
-        }
+        IndexSpec indexSpec = TaskDataWriter.getIndexSpec(
+                WriterContext.from(new CaseInsensitiveStringMap(options), DateTime.now(ISOChronology.getInstanceUTC()).toString()));
+
+        assertThat(indexSpec.getBitmapSerdeFactory(), instanceOf(RoaringBitmapSerdeFactory.class));
+        Assertions.assertEquals(CompressionStrategy.UNCOMPRESSED, indexSpec.getDimensionCompression());
+        Assertions.assertEquals(CompressionStrategy.ZSTD, indexSpec.getMetricCompression());
+        Assertions.assertEquals(CompressionFactory.LongEncodingStrategy.AUTO, indexSpec.getLongEncoding());
+        Assertions.assertEquals(CompressionStrategy.ZSTD, indexSpec.getJsonCompression());
+        assertThat(indexSpec.getStringDictionaryEncoding(), instanceOf(StringEncodingStrategy.FrontCoded.class));
+        StringEncodingStrategy.FrontCoded frontCoded = (StringEncodingStrategy.FrontCoded) indexSpec.getStringDictionaryEncoding();
+        Assertions.assertEquals(8, frontCoded.getBucketSize());
+    }
+
+    @Test
+    public void indexSpecOfTheWriterIsTheGivenOneWithoutBitmapFactory() {
+        options.put(INDEX_SPEC, "{\"bitmap\":{\"type\":\"concise\"},\"dimensionCompression\":\"uncompressed\","
+                + "\"metricCompression\":\"zstd\"}");
+
+        IndexSpec indexSpec = TaskDataWriter.getIndexSpec(
+                WriterContext.from(new CaseInsensitiveStringMap(options), DateTime.now(ISOChronology.getInstanceUTC()).toString()));
+
+        // druid.bitmap_factory is not given, so the bitmap of the spec stays
+        assertThat(indexSpec.getBitmapSerdeFactory(), instanceOf(ConciseBitmapSerdeFactory.class));
+        Assertions.assertEquals(CompressionStrategy.UNCOMPRESSED, indexSpec.getDimensionCompression());
+        Assertions.assertEquals(CompressionStrategy.ZSTD, indexSpec.getMetricCompression());
     }
 
     /**
