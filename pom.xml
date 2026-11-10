@@ -230,6 +230,12 @@
             <artifactId>druid-datasketches</artifactId>
             <version>${druid.version}</version>
         </dependency>
+        <!-- Used directly for the sketches of range partitioning (DruidRangePartitioning). Without this it would be
+             available only at runtime, as a transitive dependency of spark-catalyst. The version is managed above. -->
+        <dependency>
+            <groupId>org.apache.datasketches</groupId>
+            <artifactId>datasketches-java</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.apache.druid.extensions</groupId>
             <artifactId>mysql-metadata-storage</artifactId>

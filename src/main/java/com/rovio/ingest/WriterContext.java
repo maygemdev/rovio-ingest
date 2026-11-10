@@ -16,13 +16,21 @@
 package com.rovio.ingest;
 
 import com.google.common.base.Preconditions;
+import com.rovio.ingest.util.RangeBuckets;
+import org.apache.druid.data.input.StringTuple;
 import org.apache.druid.java.util.common.DateTimes;
+import org.apache.druid.segment.IndexSpec;
+import org.apache.druid.timeline.partition.PartitionIds;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
+import java.io.IOException;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
+import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
 import static java.lang.String.format;
 
 public class WriterContext implements Serializable {
@@ -44,6 +52,8 @@ public class WriterContext implements Serializable {
     private final String segmentGranularity;
     private final String queryGranularity;
     private final String bitmapFactory;
+    private final boolean bitmapFactoryExplicit;
+    private final String indexSpec;
     private final List<String> excludedDimensions;
     private final int segmentMaxRows;
     private final int maxRowsInMemory;
@@ -80,6 +90,9 @@ public class WriterContext implements Serializable {
     private final boolean useDefaultValueForNull;
     private final boolean useThreeValueLogicForNativeFilters;
     private final int partitionNumStart;
+    // Range partitioning. Both are null if not used. Boundaries are kept as json, because StringTuple isn't Serializable.
+    private final List<String> partitionDimensions;
+    private final String partitionBoundaries;
     private final String dimensionsSpec;
     private final String metricsSpec;
     private final String transformSpec;
@@ -91,6 +104,12 @@ public class WriterContext implements Serializable {
         this.segmentGranularity = options.getOrDefault(ConfKeys.SEGMENT_GRANULARITY, DEFAULT_SEGMENT_GRANULARITY);
         this.queryGranularity = options.getOrDefault(ConfKeys.QUERY_GRANULARITY, DEFAULT_QUERY_GRANULARITY);
         this.bitmapFactory = options.getOrDefault(ConfKeys.BITMAP_FACTORY, DEFAULT_BITMAP_FACTORY);
+        this.bitmapFactoryExplicit = options.containsKey(ConfKeys.BITMAP_FACTORY);
+        this.indexSpec = options.getOrDefault(ConfKeys.INDEX_SPEC, null);
+        if (this.indexSpec != null) {
+            // Fail early on the driver if the spec is invalid.
+            parseIndexSpec(this.indexSpec);
+        }
         this.excludedDimensions = Arrays.asList(options.getOrDefault(ConfKeys.EXCLUDED_DIMENSIONS, "").split(","));
 
         int segmentMaxRows = options.getInt(ConfKeys.SEGMENT_MAX_ROWS, DEFAULT_MAX_ROWS_PER_SEGMENT);
@@ -159,6 +178,48 @@ public class WriterContext implements Serializable {
             throw new IllegalArgumentException(format("\"%s\" should be >= 0", ConfKeys.PARTITION_NUM_START));
         }
 
+        String partitionDimensionsOption = options.getOrDefault(ConfKeys.PARTITION_DIMENSIONS, null);
+        String partitionBoundariesOption = options.getOrDefault(ConfKeys.PARTITION_BOUNDARIES, null);
+        if ((partitionDimensionsOption == null) != (partitionBoundariesOption == null)) {
+            throw new IllegalArgumentException(format("\"%s\" and \"%s\" should be given together",
+                    ConfKeys.PARTITION_DIMENSIONS, ConfKeys.PARTITION_BOUNDARIES));
+        }
+        if (partitionDimensionsOption != null) {
+            if (this.partitionNumStart != 0) {
+                throw new IllegalArgumentException(format("\"%s\" should be 0 when \"%s\" is used",
+                        ConfKeys.PARTITION_NUM_START, ConfKeys.PARTITION_DIMENSIONS));
+            }
+            this.partitionDimensions = parsePartitionDimensions(partitionDimensionsOption);
+            this.partitionBoundaries = partitionBoundariesOption;
+            try {
+                // Fail early on the driver if the boundaries are invalid.
+                RangeBuckets buckets = RangeBuckets.of(this.partitionDimensions, this.partitionBoundaries);
+                if (buckets.getNumBuckets() >= PartitionIds.ROOT_GEN_END_PARTITION_ID) {
+                    // Partition nums of a core set must be less than this. Checked here, before any segment is written.
+                    throw new IllegalArgumentException(format("%d buckets, but there must be less than %d",
+                            buckets.getNumBuckets(), PartitionIds.ROOT_GEN_END_PARTITION_ID));
+                }
+                if (this.useDefaultValueForNull) {
+                    // The empty string of a row is null then, so a boundary with "" would not split the rows as it says.
+                    for (int i = 0; i < buckets.getNumBuckets() - 1; i++) {
+                        StringTuple boundary = buckets.getEnd(i);
+                        for (int j = 0; j < boundary.size(); j++) {
+                            if ("".equals(boundary.get(j))) {
+                                throw new IllegalArgumentException(format("boundary %d (%s) has an empty string, which " +
+                                        "is the same as null when \"%s\" is true: use null instead",
+                                        i, boundary, ConfKeys.USE_DEFAULT_VALUES_FOR_NULL));
+                            }
+                        }
+                    }
+                }
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(format("Invalid \"%s\": %s", ConfKeys.PARTITION_BOUNDARIES, e.getMessage()), e);
+            }
+        } else {
+            this.partitionDimensions = null;
+            this.partitionBoundaries = null;
+        }
+
         // When the WriteBuilder is initially created, we don't know yet will truncate be enabled or not
         // Default behavior is to not truncate
         this.isAppend = true;
@@ -170,6 +231,8 @@ public class WriterContext implements Serializable {
         this.segmentGranularity = context.segmentGranularity;
         this.queryGranularity = context.queryGranularity;
         this.bitmapFactory = context.bitmapFactory;
+        this.bitmapFactoryExplicit = context.bitmapFactoryExplicit;
+        this.indexSpec = context.indexSpec;
         this.excludedDimensions = context.excludedDimensions;
         this.segmentMaxRows = context.segmentMaxRows;
         this.maxRowsInMemory = context.maxRowsInMemory;
@@ -215,6 +278,8 @@ public class WriterContext implements Serializable {
         this.version = context.version;
 
         this.partitionNumStart = context.partitionNumStart;
+        this.partitionDimensions = context.partitionDimensions;
+        this.partitionBoundaries = context.partitionBoundaries;
 
         // When using this constructor version we already know that we should truncate, thus set this flag explicitly
         this.isAppend = false;
@@ -228,6 +293,23 @@ public class WriterContext implements Serializable {
         return new WriterContext(context);
     }
 
+    private static List<String> parsePartitionDimensions(String commaSeparated) {
+        List<String> dimensions = new ArrayList<>();
+        for (String dimension : commaSeparated.split(",", -1)) {
+            String trimmed = dimension.trim();
+            if (trimmed.isEmpty()) {
+                throw new IllegalArgumentException(format("Invalid \"%s\": empty dimension name in \"%s\"",
+                        ConfKeys.PARTITION_DIMENSIONS, commaSeparated));
+            }
+            if (dimensions.contains(trimmed)) {
+                throw new IllegalArgumentException(format("Invalid \"%s\": duplicate dimension \"%s\"",
+                        ConfKeys.PARTITION_DIMENSIONS, trimmed));
+            }
+            dimensions.add(trimmed);
+        }
+        return Collections.unmodifiableList(dimensions);
+    }
+
     private static String getOrThrow(CaseInsensitiveStringMap options, String key) {
         if (options.containsKey(key)) {
             return options.get(key);
@@ -238,6 +320,22 @@ public class WriterContext implements Serializable {
 
     private static IllegalArgumentException missingKeyError(String key) {
         return new IllegalArgumentException(format("Missing mandatory \"%s\" option", key));
+    }
+
+    /**
+     * Parses the given JSON as {@link IndexSpec}, so that an invalid value fails on the driver instead of in a task.
+     */
+    static IndexSpec parseIndexSpec(String json) {
+        IndexSpec parsed;
+        try {
+            parsed = MAPPER.readValue(json, IndexSpec.class);
+        } catch (IOException | RuntimeException e) {
+            throw new IllegalArgumentException(format("Invalid \"%s\": %s", ConfKeys.INDEX_SPEC, e.getMessage()), e);
+        }
+        if (parsed == null) {
+            throw new IllegalArgumentException(format("Invalid \"%s\": expected a JSON object", ConfKeys.INDEX_SPEC));
+        }
+        return parsed;
     }
 
     public String getDataSource() {
@@ -258,6 +356,21 @@ public class WriterContext implements Serializable {
 
     public String getBitmapFactory() {
         return bitmapFactory;
+    }
+
+    /**
+     * @return true if {@link ConfKeys#BITMAP_FACTORY} was given in the options, false if {@link #getBitmapFactory()}
+     * is just the default.
+     */
+    public boolean isBitmapFactoryExplicit() {
+        return bitmapFactoryExplicit;
+    }
+
+    /**
+     * @return the {@link ConfKeys#INDEX_SPEC} JSON as given in the options, or null if it was not set.
+     */
+    public String getIndexSpec() {
+        return indexSpec;
     }
 
     public List<String> getExcludedDimensions() {
@@ -412,6 +525,28 @@ public class WriterContext implements Serializable {
         return partitionNumStart;
     }
 
+    /**
+     * @return true if the segments are range partitioned, see {@link ConfKeys#PARTITION_DIMENSIONS}
+     */
+    public boolean isRangePartitioned() {
+        return partitionDimensions != null;
+    }
+
+    /**
+     * @return the dimensions of the range partitioning, null if {@link #isRangePartitioned()} is false
+     */
+    public List<String> getPartitionDimensions() {
+        return partitionDimensions;
+    }
+
+    /**
+     * @return the interior boundaries of the range partitioning as a json array, null if {@link #isRangePartitioned()}
+     * is false
+     */
+    public String getPartitionBoundaries() {
+        return partitionBoundaries;
+    }
+
     public String getDimensionsSpec() {
         return dimensionsSpec;
     }
@@ -439,6 +574,7 @@ public class WriterContext implements Serializable {
         public static final String SEGMENT_GRANULARITY = "druid.segment_granularity";
         public static final String QUERY_GRANULARITY = "druid.query_granularity";
         public static final String BITMAP_FACTORY = "druid.bitmap_factory";
+        public static final String INDEX_SPEC = "druid.index_spec";
         public static final String EXCLUDED_DIMENSIONS = "druid.exclude_dimensions";
         public static final String SEGMENT_MAX_ROWS = "druid.segment.max_rows";
         public static final String MAX_ROWS_IN_MEMORY = "druid.memory.max_rows";
@@ -447,6 +583,10 @@ public class WriterContext implements Serializable {
         public static final String USE_THREE_VALUE_LOGIC_FOR_NATIVE_FILTERS = "druid.use_three_value_logic_for_native_filters";
         public static final String SEGMENT_VERSION = "druid.segment_version";
         public static final String PARTITION_NUM_START = "druid.partition_num_start";
+        // Range partitioning, e.g. "country,client"
+        public static final String PARTITION_DIMENSIONS = "druid.partition_dimensions";
+        // The K-1 interior boundary tuples as a json array, e.g. [["FI","12"],["US","3"]]
+        public static final String PARTITION_BOUNDARIES = "druid.partition_boundaries";
         // Metadata config
         public static final String METADATA_DB_TYPE = "druid.metastore.db.type";
         public static final String METADATA_DB_URI = "druid.metastore.db.uri";

@@ -362,7 +362,8 @@ These are the options for `DruidSource`, to be passed with `write.options()`.
 | `druid.segment_storage.type` | Type of Deep Storage to use. Allowed values: `s3`, `local`, `hdfs`, `azure`. | `s3` |
 | `druid.segment_storage.s3.disableacl` | Whether to disable ACL in S3 config. | `false` |
 | `druid.datasource.init` | Boolean flag for (re-)initializing Druid datasource. If `true`, any pre-existing segments for the datasource is marked as unused. | `false` |
-| `druid.bitmap_factory` | Compression format for bitmap indexes. Possible values: `concise`, `roaring`. For type `roaring`, the boolean property compressRunOnSerialization is always set to `true`. `rovio-ingest` uses `concise` by default regardless of Druid library version. | `concise` |
+| `druid.bitmap_factory` | Compression format for bitmap indexes. Possible values: `concise`, `roaring`. For type `roaring`, the boolean property compressRunOnSerialization is always set to `true`. `rovio-ingest` uses `concise` by default regardless of Druid library version. If `druid.index_spec` is also set, an explicitly given `druid.bitmap_factory` takes precedence over the `bitmap` of the index spec. | `concise` |
+| `druid.index_spec` | Druid [indexSpec](https://druid.apache.org/docs/latest/ingestion/ingestion-spec/#indexspec) for the written segments, as a json object string. Allows, for example, to use front coded string dictionaries. Anything not given in the json gets Druid's default, including `bitmap`, unless `druid.bitmap_factory` is given explicitly. See [indexSpec example](#indexspec-example). | Not set: all defaults of `rovio-ingest`, including `druid.bitmap_factory` |
 | `druid.segment.rollup` | Whether to rollup data during ingestion | `true` |
 | `druid.segment.rollup` | Whether to rollup data during ingestion. Enabling this requires that there be at least one numeric input column. | `true` |
 | `druid.use_default_values_for_null` | Whether to use default values for nulls. See [SQL compatible null handling](https://druid.apache.org/docs/latest/querying/sql-data-types/#legacy-null-handling-mode) for details. | `true` |
@@ -372,6 +373,137 @@ These are the options for `DruidSource`, to be passed with `write.options()`.
 | `druid.dimensions_spec` | List of dimensions provided as json string, when not provided defaults to all non metric/non time_column fields. See [DimensionsSpec](https://druid.apache.org/docs/latest/ingestion/index.html#dimensionsspec) for details | |
 | `druid.metrics_spec` | List of aggregators to apply at ingestion time as a json array string. Possible aggregators: [metricsSpec in Druid Docs](https://druid.apache.org/docs/latest/ingestion/ingestion-spec.html#metricsspec). When not provided, defaults to using `longSum` or `doubleSum` for all numeric columns. [Datasketches](https://druid.apache.org/docs/latest/development/extensions-core/datasketches-extension.html) are supported only with this config, see [datasketches notebook](python/notebooks/druid_sketch_ingestion_test.ipynb). See also: [No-Code wrapper script](#no-code-wrapper-script). | |
 | `druid.transform_spec` | List of transformations provided as json string, when not provided defaults to no transformations. See [TransformSpec](https://druid.apache.org/docs/latest/ingestion/index.html#transformspec) for details | |
+
+#### indexSpec example
+
+An example value for `druid.index_spec`, with front coded string dictionaries. Pass it as a string in the language of your choice. It must be readable as an `IndexSpec`, which is checked before any segments are written, but as in Druid keys that are not known are ignored, so check their spelling:
+
+```json
+{
+  "bitmap": {"type": "roaring"},
+  "dimensionCompression": "lz4",
+  "stringDictionaryEncoding": {"type": "frontCoded", "bucketSize": 4, "formatVersion": 1},
+  "metricCompression": "lz4",
+  "longEncoding": "longs"
+}
+```
+
+#### Range partitioned segments
+
+By default all segments are written with `linear` shard specs, which means that Druid brokers can't skip any of the
+segments of an interval when a query has filters. Optionally, the segments of an interval can be written as a
+range partitioned core set, as Druid range partitioning (`"partitionsSpec": {"type": "range"}`) would produce. Then
+rows are clustered by the partition dimensions, and the broker can prune the segments by filters on them.
+
+| Property | Description |
+| --- | --- |
+| `druid.partition_dimensions` | Comma separated list of the dimensions to partition by, in order of significance. Must be dimensions of the segments, of type string. |
+| `druid.partition_boundaries` | The K-1 interior boundaries of the K buckets, as a json array of arrays of strings, one string for each partition dimension and `null` for a missing value. For example `[["FI","12"],["US","3"]]` for dimensions `country,client` defines three buckets: `[null, ("FI","12"))`, `[("FI","12"), ("US","3"))` and `[("US","3"), null)`. The boundaries must be strictly increasing. `[]` is a single bucket. |
+
+The two options must be given together. Requirements:
+- The write mode must be `SaveMode.Overwrite`. Segments appended later to the interval are written as
+  [`numbered` segments](#append-mode-and-shard-specs) without these options.
+- The dataset must have columns `__PARTITION_TIME__` and `__PARTITION_NUM__`, and be partitioned so that each Spark
+  task writes whole buckets, e.g. by `__PARTITION_NUM__`. `__PARTITION_NUM__` is the number of the bucket (from 0 to
+  K-1) of the row. Rows are validated: a row that doesn't belong to its bucket fails the write. If the rows of a bucket
+  end up in several Spark tasks, the write fails when committing.
+- The buckets must be ordered in the same way as Druid orders them: values are compared as strings by their UTF-16 code
+  units, and `null` is before any other value. In particular, don't use `repartitionByRange` on the dimension columns.
+- Only a single interval, i.e. a single `__PARTITION_TIME__`, can be written at a time.
+- A write that has no rows publishes nothing and is not an error, as without these options.
+- `druid.partition_num_start` must be `0`, and `druid.segment.max_rows` is ignored. There is one segment for each
+  bucket.
+- Every bucket must have rows. If a bucket has none, the write fails when committing and the pushed segments are
+  removed, because Druid would not serve an interval whose core set of segments is incomplete. Boundaries from
+  `DruidRangePartitioning` have no empty buckets, if the same rows are written as were used to compute them.
+- The number of buckets must be less than 32768.
+- With `druid.use_default_values_for_null` an empty string value of a row is the same as `null`, when the bucket of
+  the row is checked. So a boundary can't have `""` in that mode, use `null` instead: such a boundary is rejected
+  before anything is written.
+
+Note that Druid doesn't serve an interval before all of its core segments are loaded.
+
+##### Computing the buckets
+
+`DruidRangePartitioning` computes the boundaries and the buckets of the rows in Spark, in the same way as Druid does
+for a range partitioned ingestion: the boundaries are quantiles of the values of the partition dimensions, such that the
+buckets have about the same number of rows, `targetRowsPerSegment`.
+
+```java
+import com.rovio.ingest.extensions.java.DruidRangePartitioning;
+
+// aggregated: the dataset to be written, already rolled up, one row for each row of Druid
+DruidRangePartitioning partitioning = DruidRangePartitioning.compute(
+        aggregated, Arrays.asList("country", "client"), 5_000_000, true);
+
+options.put(ConfKeys.PARTITION_DIMENSIONS, "country,client");
+options.put(ConfKeys.PARTITION_BOUNDARIES, partitioning.getBoundariesJson());
+
+aggregated
+    // the interval of the rows, in the same way as for __PARTITION_TIME__ of the Dataset extension
+    .withColumn("__PARTITION_TIME__", functions.col("date"))
+    .withColumn("__PARTITION_NUM__", partitioning.bucketColumn())
+    .repartitionByRange(partitioning.getNumBuckets(), functions.col("__PARTITION_NUM__"))
+    .write()
+    .format(DruidSource.FORMAT)
+    .mode(SaveMode.Overwrite)
+    .options(options)
+    .save();
+```
+
+- The dataset is scanned once to compute the boundaries. It must give the same rows when it is written, otherwise a
+  bucket can end up without rows and the write fails, so cache it unless it is deterministic. The number of rows is the
+  number of the rows of the dataset, so it must be already rolled up. The sketches of the Spark partitions are merged in
+  several steps on the executors (`treeAggregate`), so the driver gets only a few partial sketches, about the square
+  root of the number of Spark partitions, instead of one for each partition. A sketch can be several MB.
+- The number of the buckets is the number of rows divided by `targetRowsPerSegment`, rounded, at least 1. It can be less
+  if some values are very common (a single value can't be split to several buckets), and `partitioning.getNumBuckets()`
+  tells the actual number. The boundaries are approximate: the segments don't have exactly the same number of rows.
+- The last argument is `druid.use_default_values_for_null` of the write, which defaults to `true`.
+- The partition dimensions must be columns of the dataset, of type string.
+- Use `repartitionByRange` or `repartition` only on `__PARTITION_NUM__`, not on the dimension columns, see above.
+- `repartitionByRange(K, col("__PARTITION_NUM__"))` is correct, as each bucket ends up in one task, but it doesn't
+  give exactly one bucket for each task: with 5 buckets one task got two buckets and another got none. That only
+  affects how evenly the write is spread over the tasks. Since Spark 4.1.0 there is
+  `Dataset.repartitionById(K, col("__PARTITION_NUM__"))`, which puts the bucket `i` to the partition `i`.
+
+#### Append mode and shard specs
+
+With `SaveMode.Append`, the shard spec of the new segments is chosen to match the segments already published for the
+same time interval (the max used version of it), because Druid can't serve a version that mixes linear segments with
+non-linear ones (e.g. range or numbered):
+
+| Existing used segments of the interval | Shard spec of the appended segments |
+| --- | --- |
+| None | `linear`, with a new version |
+| All `linear` | `linear` |
+| No `linear` (e.g. `range`, `numbered`, `hashed`, as written by Druid compaction) | `numbered` with the number of core partitions of the existing segments. Such segments are appended in the same version without changing when it becomes visible. |
+| Both `linear` and non-linear, other kinds of segments (e.g. `none`, `tombstone`, `numbered_overwrite`), or an unknown number of core partitions | Not supported, the write fails |
+
+In both cases the partition num of the new segments starts from `max("druid.partition_num_start", "max existing partition num + 1")`.
+For `numbered` segments it is also never less than the number of core partitions, so that new segments don't take the
+partition num of a core segment. For `numbered` segments the partition num must be less than 32768, and the partition
+nums of the dataset (`__PARTITION_NUM__`) must not be negative, otherwise the write fails.
+
+Limitations:
+- The segments of the interval are looked up by exactly the interval of the new segments. If Druid compacted the data
+  into segments of a coarser granularity (e.g. hourly segments into one segment of the day), appending to one of the
+  hours doesn't see the compacted segment, and the write succeeds, but its rows are not what you want:
+  - If the hourly segments are still used, the new segments are added to the old hourly version, which the compacted
+    segment overshadows. Their rows are never queried.
+  - If the hourly segments are not used any more, the new segments are `linear` and have the version of the write.
+    Without `druid.segment_version` that is the time of the write, which is higher than the version of the compacted
+    segment: the new segments overshadow that hour of the compacted segment, so queries for the hour return only the
+    appended rows, and the rows that were there disappear. With an explicit `druid.segment_version` that is lower than
+    the version of the compacted segment, the new segments are overshadowed instead, and their rows are never queried.
+
+  Append to the interval of the segments that Druid serves.
+- Prepare the dataset with the [Dataset extension](#dataset-extension), so that it has `__PARTITION_TIME__` and
+  `__PARTITION_NUM__`. Without them a write that has more rows than `druid.segment.max_rows`, or that has several
+  Spark tasks, is not supported. A known limitation of that case is that when the write is split into several
+  segments, the partition num of the next one is derived from the full partition num of the previous one, which
+  already includes `druid.partition_num_start` (or the first partition num of an append). With a non-zero start the
+  partition nums grow faster than by one, and for `numbered` segments they can reach the limit of 32768.
 
 ## Limitations
 

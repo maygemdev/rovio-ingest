@@ -15,6 +15,7 @@
  */
 package com.rovio.ingest.util;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.rovio.ingest.WriterContext;
@@ -31,12 +32,15 @@ import org.apache.druid.metadata.storage.postgresql.PostgreSQLConnector;
 import org.apache.druid.metadata.storage.postgresql.PostgreSQLConnectorConfig;
 import org.apache.druid.metadata.storage.postgresql.PostgreSQLTablesConfig;
 import org.apache.druid.timeline.DataSegment;
+import org.apache.druid.timeline.partition.ShardSpec;
 import org.joda.time.Interval;
 import org.skife.jdbi.v2.PreparedBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import static com.rovio.ingest.DataSegmentCommitMessage.MAPPER;
@@ -47,9 +51,14 @@ public class MetadataUpdater {
 
     private static final String SELECT_UNUSED_OLD_SEGMENTS =
             "SELECT id FROM %1$s WHERE dataSource = :dataSource AND version < :version AND used = true AND id NOT IN (:ids)";
-    private static final String SELECT_USED_SEGMENT_IDS_BY_INTERVAL =
-            "SELECT id FROM %1$s WHERE dataSource = :dataSource AND start = :start AND %2$send%2$s = :end AND used = true " +
+    // Used segments of the max used version of an interval.
+    private static final String FROM_USED_SEGMENTS_BY_INTERVAL =
+            "FROM %1$s WHERE dataSource = :dataSource AND start = :start AND %2$send%2$s = :end AND used = true " +
                     "AND version = (SELECT MAX(version) FROM %1$s WHERE dataSource = :dataSource AND start = :start AND %2$send%2$s = :end AND used = true)";
+    private static final String SELECT_USED_SEGMENT_IDS_BY_INTERVAL =
+            "SELECT id " + FROM_USED_SEGMENTS_BY_INTERVAL;
+    private static final String SELECT_USED_SEGMENT_SHARD_SPECS_BY_INTERVAL =
+            "SELECT id, version, payload " + FROM_USED_SEGMENTS_BY_INTERVAL;
     private static final String MARK_SEGMENT_AS_UNUSED_BY_ID =
             "UPDATE %1$s SET used=false WHERE id = :id";
 
@@ -171,6 +180,11 @@ public class MetadataUpdater {
         }
     }
 
+    /**
+     * @deprecated Returns only the ids of the segments. Use {@link #findUsedSegmentShardSpecs} instead, which also
+     * tells the shard specs of the segments.
+     */
+    @Deprecated(since = "1.0.9", forRemoval = true)
     public List<String> findUsedSegments(String dataSource, Interval interval) {
         return sqlConnector.getDBI().withHandle(handle -> {
             return handle.createQuery(String.format(SELECT_USED_SEGMENT_IDS_BY_INTERVAL, segmentsTable, sqlConnector.getQuoteString()))
@@ -182,5 +196,44 @@ public class MetadataUpdater {
                     .map(m -> m.get("id").toString())
                     .collect(Collectors.toList());
         });
+    }
+
+    /**
+     * Finds the used segments of the max used version of the given interval, with their version and shard spec.
+     * <p>
+     * Only the {@code shardSpec} is read from the segment payload (not the whole {@link DataSegment}), so that
+     * unrelated parts of the payload, such as {@code lastCompactionState} of compacted segments, can't make this fail.
+     */
+    public List<VersionedShardSpec> findUsedSegmentShardSpecs(String dataSource, Interval interval) {
+        List<Map<String, Object>> rows = sqlConnector.getDBI().withHandle(handle -> {
+            return handle.createQuery(String.format(SELECT_USED_SEGMENT_SHARD_SPECS_BY_INTERVAL, segmentsTable, sqlConnector.getQuoteString()))
+                    .bind("dataSource", dataSource)
+                    .bind("start", interval.getStart().toString())
+                    .bind("end", interval.getEnd().toString())
+                    .list();
+        });
+        // Parse outside of the handle callback, so that failures are not wrapped by the DBI.
+        return rows.stream()
+                .map(m -> new VersionedShardSpec(m.get("version").toString(), readShardSpec(m.get("id").toString(), m.get("payload"))))
+                .collect(Collectors.toList());
+    }
+
+    private static ShardSpec readShardSpec(String segmentId, Object payload) {
+        try {
+            // The payload is a BLOB in MySQL and BYTEA in PostgreSQL, both are returned as byte[].
+            JsonNode shardSpec = MAPPER.readTree((byte[]) payload).get("shardSpec");
+            if (shardSpec == null) {
+                throw new IllegalStateException(format("Segment %s has no shardSpec in its payload", segmentId));
+            }
+            return MAPPER.treeToValue(shardSpec, ShardSpec.class);
+        } catch (IOException e) {
+            throw new IllegalStateException(format("Failed to read the shardSpec of segment %s", segmentId), e);
+        }
+    }
+
+    /**
+     * Version and shard spec of a used segment.
+     */
+    public record VersionedShardSpec(String version, ShardSpec shardSpec) {
     }
 }

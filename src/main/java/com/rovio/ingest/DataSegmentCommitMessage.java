@@ -57,7 +57,10 @@ public class DataSegmentCommitMessage implements WriterCommitMessage {
                         .addValue(ExprMacroTable.class, ExprMacroTable.nil())
                         .addValue(DefaultColumnFormatConfig.class, new DefaultColumnFormatConfig(null))
                         // PruneLoadSpecHolder are injected in DataSegment.
-                        .addValue(DataSegment.PruneSpecsHolder.class, DataSegment.PruneSpecsHolder.DEFAULT);
+                        .addValue(DataSegment.PruneSpecsHolder.class, DataSegment.PruneSpecsHolder.DEFAULT)
+                        // ObjectMapper is injected in HashBasedNumberedShardSpec, which is needed when reading the
+                        // shard specs of existing segments that were written with hash partitioning.
+                        .addValue(ObjectMapper.class, MAPPER);
 
         MAPPER.setInjectableValues(injectableValues);
         // Register LinearShardSpec as a sub type to be used by the mapper for deserializing DataSegment from json.
